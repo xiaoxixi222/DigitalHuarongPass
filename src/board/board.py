@@ -4,7 +4,7 @@ import pygame
 
 logger = logging.getLogger("game.board")
 
-
+#deepseek加的这个注释句号有点多啊
 class Board:
     """棋盘类，表示数字华容道的棋盘。
 
@@ -32,12 +32,29 @@ class Board:
         自动寻找挨着他的空白格，并完成与空白格的交换此时输出空白格的坐标(用于制作动画),若点击的为空白格或点击格周围没有空白格，则输出false
 
         Args:
-            pos (pygame.Vector2): 位置的坐标。
+            pos (pygame.Vector2): 被点击格子的坐标，x 为行索引，y 为列索引（与点击处理得到的 block_num=(行, 列) 一致）。
 
         Returns:
-            pygame.Vector2 | None: 如果交换成功，返回空白格的位置；否则返回 None。
+            pygame.Vector2 | None: 如果交换成功，返回空白格交换后的坐标（x 为行索引，y 为列索引）；否则返回 None。
         """
-        pass  # wu写
+        row, col = int(pos.x), int(pos.y)
+        if not (0 <= row < self.row and 0 <= col < self.col):
+            return None
+        if self.board[row][col] == -1:
+            return None
+
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            blank_row, blank_col = row + dr, col + dc
+            if 0 <= blank_row < self.row and 0 <= blank_col < self.col:
+                if self.board[blank_row][blank_col] == -1:
+                    self.board[row][col], self.board[blank_row][blank_col] = (
+                        self.board[blank_row][blank_col],
+                        self.board[row][col],
+                    )
+                    logger.debug(f"Swapped ({row},{col}) with blank ({blank_row},{blank_col})")
+                    return pygame.Vector2(blank_row, blank_col)
+
+        return None
 
     def checkWin(self) -> bool:
         """检查当前棋盘是否处于胜利状态。
@@ -45,7 +62,9 @@ class Board:
         Returns:
             bool: 如果棋盘处于胜利状态，返回 True；否则返回 False。
         """
-        pass  # wu写
+        flat = [v for line in self.board for v in line]
+        expected = list(range(1, self.col * self.row)) + [-1]
+        return flat == expected
 
 
 def generate_board(col: int, row: int) -> list[list[int]]:
@@ -73,7 +92,7 @@ def generate_board(col: int, row: int) -> list[list[int]]:
         solvable = inversions % 2 == 0
     else:
         solvable = (inversions + blank_row_from_bottom) % 2 == 1
-
+#不可解情况(这破玩意怎么这么难搞)
     if not solvable:
         positions = [
             (r, c) for r in range(row) for c in range(col) if board[r][c] != -1
