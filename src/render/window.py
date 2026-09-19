@@ -73,7 +73,7 @@ def start(board: Board):
                     ]
                     board.board[ROW_NUMBER - 1][COL_NUMBER - 1] = -1
                     logger.info("Resetting the board to the initial state.")
-        
+
         highlight_blocks[(block_num[1], block_num[0])] = (
             tick  # Reset the highlight animation for this block
         )
@@ -108,28 +108,36 @@ def start(board: Board):
                 ):
                     old_color = pygame.Color(BLOCK_HIGHLIGHT_COLOR)
                     new_color = pygame.Color(BACKGROUND_COLOR)
-                    logger.debug(
-                        f"Highlighting block {row},{col} with color {(new_color.r - old_color.r)
-                        * (tick - highlight_blocks[(row, col)])
-                        / HIGHLIGHT_TIME+old_color.r}"
-                    )
+                    # logger.debug(
+                    #    f"Highlighting block {row},{col} with color {(new_color.r - old_color.r)
+                    #    * (tick - highlight_blocks[(row, col)])
+                    #    / HIGHLIGHT_TIME+old_color.r}"
+                    # )
                     color = pygame.Color(
-                        int((new_color.r - old_color.r)
-                        * (tick - highlight_blocks[(row, col)])
-                        / HIGHLIGHT_TIME
-                        + old_color.r),
-                        int((new_color.g - old_color.g)
-                        * (tick - highlight_blocks[(row, col)])
-                        / HIGHLIGHT_TIME
-                        + old_color.g),
-                        int((new_color.b - old_color.b)
-                        * (tick - highlight_blocks[(row, col)])
-                        / HIGHLIGHT_TIME
-                        + old_color.b),
-                        int((new_color.a - old_color.a)
-                        * (tick - highlight_blocks[(row, col)])
-                        / HIGHLIGHT_TIME
-                        + old_color.a),
+                        int(
+                            (new_color.r - old_color.r)
+                            * (tick - highlight_blocks[(row, col)])
+                            / HIGHLIGHT_TIME
+                            + old_color.r
+                        ),
+                        int(
+                            (new_color.g - old_color.g)
+                            * (tick - highlight_blocks[(row, col)])
+                            / HIGHLIGHT_TIME
+                            + old_color.g
+                        ),
+                        int(
+                            (new_color.b - old_color.b)
+                            * (tick - highlight_blocks[(row, col)])
+                            / HIGHLIGHT_TIME
+                            + old_color.b
+                        ),
+                        int(
+                            (new_color.a - old_color.a)
+                            * (tick - highlight_blocks[(row, col)])
+                            / HIGHLIGHT_TIME
+                            + old_color.a
+                        ),
                     )
                     pygame.draw.rect(screen, color, rect)
                 pygame.draw.rect(screen, BLOCK_COLOR, rect, 2)  # Draw the block border
