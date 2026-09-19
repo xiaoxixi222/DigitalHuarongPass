@@ -2,7 +2,7 @@ import pygame
 from pygame.locals import *
 import logging
 from config.basic import ROW_NUMBER, COL_NUMBER, LOGS_DIR
-from config.render import BACKGROUND_COLOR, BLOCK_COLOR
+from config.render import BACKGROUND_COLOR, BLOCK_COLOR, TEXT_COLOR
 from board import Board
 
 logger = logging.getLogger("game.render")
@@ -20,20 +20,37 @@ def start(board: Board):
         for event in pygame.event.get():
             if event.type == QUIT:
                 running = False
-            if event.type == MOUSEBUTTONDOWN:
+            elif event.type == MOUSEBUTTONDOWN:
                 # logger.info(f"Mouse button pressed at position {event.pos}")
+                if event.button != 1:
+                    continue
                 mouse_pos = event.pos
                 block_num = (-1, -1)
                 for i, rects in enumerate(blockRects):
                     for j, rect in enumerate(rects):
                         if rect.collidepoint(mouse_pos):
                             logger.info(
-                                f"Block {i},{j} clicked at position {mouse_pos}"
+                                f"Block {j},{i} clicked at position {mouse_pos}"
                             )
-                            block_num = (i, j)
+                            block_num = (j, i)
+
                             break
                     if block_num != (-1, -1):
                         break
+                if block_num != (-1, -1):
+                    logger.info(f"Swapping block {block_num}")
+                    logger.info(
+                        f"Result: {board.dealWithSwap(pygame.Vector2(block_num[0], block_num[1]))}"
+                    )
+                    if board.checkWin():
+                        logger.info("You win!")
+                        running = False
+            elif event.type == KEYDOWN:
+                logger.info(f"Key pressed: {pygame.key.name(event.key)}")
+                if event.key == K_ESCAPE:
+                    board.board = [[i for i in range(j * COL_NUMBER+1, (j + 1) * COL_NUMBER+1)] for j in range(ROW_NUMBER)]
+                    board.board[ROW_NUMBER - 1][COL_NUMBER - 1] = -1
+                    logger.info("Resetting the board to the initial state.")
 
         screen.fill(BACKGROUND_COLOR)  # Fill the screen with the background color
         # Draw game elements here
@@ -66,7 +83,26 @@ def start(board: Board):
             blockRects.append(tmp)
 
         pygame.display.flip()  # Update the display
-
+    old_screen = screen.copy()
+    while True:
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                pygame.quit()
+                return
+            elif event.type == KEYDOWN and event.key == K_ESCAPE:
+                pygame.quit()
+                return
+        screen.fill(BACKGROUND_COLOR)
+        screen.blit(old_screen, (0, 0))
+        screen.blit(
+            pygame.font.Font(None, 72).render("You Win!", True, TEXT_COLOR),
+            (screen.get_width() // 2 - 100, screen.get_height() // 2 - 36)
+        )
+        screen.blit(
+            pygame.font.Font(None, 36).render("Press ESC to exit.", True, TEXT_COLOR),
+            (screen.get_width() // 2 - 100, screen.get_height() // 2 + 36)
+        )
+        pygame.display.flip()
     pygame.quit()
 
 
@@ -74,9 +110,7 @@ def main() -> None:
     """控制台入口：建立棋盘、初始化日志并启动游戏窗口。"""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     logger_ = logging.getLogger("game")
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s:%(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s:%(message)s")
     logger_.setLevel(logging.DEBUG)
     logger_.addHandler(logging.StreamHandler())
     logger_.addHandler(logging.FileHandler(LOGS_DIR / "game.log", mode="w"))

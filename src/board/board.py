@@ -4,7 +4,8 @@ import pygame
 
 logger = logging.getLogger("game.board")
 
-#deepseek加的这个注释句号有点多啊
+
+# deepseek加的这个注释句号有点多啊, 注释是我写的，给你看的
 class Board:
     """棋盘类，表示数字华容道的棋盘。
 
@@ -37,7 +38,7 @@ class Board:
         Returns:
             pygame.Vector2 | None: 如果交换成功，返回空白格交换后的坐标（x 为行索引，y 为列索引）；否则返回 None。
         """
-        row, col = int(pos.x), int(pos.y)
+        row, col = int(pos.y), int(pos.x)
         if not (0 <= row < self.row and 0 <= col < self.col):
             return None
         if self.board[row][col] == -1:
@@ -51,7 +52,9 @@ class Board:
                         self.board[blank_row][blank_col],
                         self.board[row][col],
                     )
-                    logger.debug(f"Swapped ({row},{col}) with blank ({blank_row},{blank_col})")
+                    logger.debug(
+                        f"Swapped ({row},{col}) with blank ({blank_row},{blank_col})"
+                    )
                     return pygame.Vector2(blank_row, blank_col)
 
         return None
@@ -64,6 +67,7 @@ class Board:
         """
         flat = [v for line in self.board for v in line]
         expected = list(range(1, self.col * self.row)) + [-1]
+        logger.debug(f"Checking win condition: current={flat}, expected={expected}")
         return flat == expected
 
 
@@ -92,7 +96,7 @@ def generate_board(col: int, row: int) -> list[list[int]]:
         solvable = inversions % 2 == 0
     else:
         solvable = (inversions + blank_row_from_bottom) % 2 == 1
-#不可解情况(这破玩意怎么这么难搞)
+# 不可解情况(这破玩意怎么这么难搞)
     if not solvable:
         positions = [
             (r, c) for r in range(row) for c in range(col) if board[r][c] != -1
