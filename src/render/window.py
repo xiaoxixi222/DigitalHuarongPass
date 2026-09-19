@@ -2,12 +2,19 @@ import pygame
 from pygame.locals import *
 import logging
 from config.basic import ROW_NUMBER, COL_NUMBER, LOGS_DIR
-from config.render import BACKGROUND_COLOR, BLOCK_COLOR, TEXT_COLOR
+from config.render import (
+    BACKGROUND_COLOR,
+    BLOCK_COLOR,
+    BLOCK_HIGHLIGHT_COLOR,
+    TEXT_COLOR,
+    HIGHLIGHT_TIME,
+)
 from board import Board
 
 logger = logging.getLogger("game.render")
 
 blockRects = []
+highlight_blocks: dict[tuple[int, int], int] = {}  # 记录方格上次需要高亮的时刻。
 
 
 def start(board: Board):
@@ -15,8 +22,12 @@ def start(board: Board):
     screen: pygame.Surface = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
     pygame.display.set_caption("DigitalHuarongPass")
 
+    block_num = (-1, -1)
+
     running = True
+    win = False
     while running:
+        tick = pygame.time.get_ticks()
         for event in pygame.event.get():
             if event.type == QUIT:
                 running = False
@@ -24,19 +35,6 @@ def start(board: Board):
                 # logger.info(f"Mouse button pressed at position {event.pos}")
                 if event.button != 1:
                     continue
-                mouse_pos = event.pos
-                block_num = (-1, -1)
-                for i, rects in enumerate(blockRects):
-                    for j, rect in enumerate(rects):
-                        if rect.collidepoint(mouse_pos):
-                            logger.info(
-                                f"Block {j},{i} clicked at position {mouse_pos}"
-                            )
-                            block_num = (j, i)
-
-                            break
-                    if block_num != (-1, -1):
-                        break
                 if block_num != (-1, -1):
                     logger.info(f"Swapping block {block_num}")
                     logger.info(
@@ -45,13 +43,40 @@ def start(board: Board):
                     if board.checkWin():
                         logger.info("You win!")
                         running = False
+                        win = True
+            elif event.type == MOUSEMOTION:
+                old_block_num = block_num
+                block_num = (-1, -1)
+                mouse_pos = event.pos
+                # logger.debug(f"Mouse moved to position {mouse_pos}")
+                for i, rects in enumerate(blockRects):
+                    for j, rect in enumerate(rects):
+                        # logger.debug(f"Checking block {j},{i} at position {mouse_pos}")
+                        if rect.collidepoint(mouse_pos):
+                            # logger.debug(f"Mouse is over block {j},{i} at position {mouse_pos}")
+                            if old_block_num != (j, i):
+                                logger.info(
+                                    f"Move to block {j},{i} at position {mouse_pos}"
+                                )
+                            block_num = (j, i)
+                            break
+                    if block_num != (-1, -1):
+                        break
+                # logger.debug(f"Current block under mouse: {block_num}")
+
             elif event.type == KEYDOWN:
                 logger.info(f"Key pressed: {pygame.key.name(event.key)}")
                 if event.key == K_ESCAPE:
-                    board.board = [[i for i in range(j * COL_NUMBER+1, (j + 1) * COL_NUMBER+1)] for j in range(ROW_NUMBER)]
+                    board.board = [
+                        [i for i in range(j * COL_NUMBER + 1, (j + 1) * COL_NUMBER + 1)]
+                        for j in range(ROW_NUMBER)
+                    ]
                     board.board[ROW_NUMBER - 1][COL_NUMBER - 1] = -1
                     logger.info("Resetting the board to the initial state.")
-
+        
+        highlight_blocks[(block_num[1], block_num[0])] = (
+            tick  # Reset the highlight animation for this block
+        )
         screen.fill(BACKGROUND_COLOR)  # Fill the screen with the background color
         # Draw game elements here
         block_size = min(
@@ -77,12 +102,45 @@ def start(board: Board):
                 font = pygame.font.Font(None, int(block_size * 0.5))
                 text_surface = font.render(text, True, BLOCK_COLOR)
                 text_rect = text_surface.get_rect(center=rect.center)
+                if (
+                    tick - highlight_blocks.get((row, col), -HIGHLIGHT_TIME)
+                    < HIGHLIGHT_TIME
+                ):
+                    old_color = pygame.Color(BLOCK_HIGHLIGHT_COLOR)
+                    new_color = pygame.Color(BACKGROUND_COLOR)
+                    logger.debug(
+                        f"Highlighting block {row},{col} with color {(new_color.r - old_color.r)
+                        * (tick - highlight_blocks[(row, col)])
+                        / HIGHLIGHT_TIME+old_color.r}"
+                    )
+                    color = pygame.Color(
+                        int((new_color.r - old_color.r)
+                        * (tick - highlight_blocks[(row, col)])
+                        / HIGHLIGHT_TIME
+                        + old_color.r),
+                        int((new_color.g - old_color.g)
+                        * (tick - highlight_blocks[(row, col)])
+                        / HIGHLIGHT_TIME
+                        + old_color.g),
+                        int((new_color.b - old_color.b)
+                        * (tick - highlight_blocks[(row, col)])
+                        / HIGHLIGHT_TIME
+                        + old_color.b),
+                        int((new_color.a - old_color.a)
+                        * (tick - highlight_blocks[(row, col)])
+                        / HIGHLIGHT_TIME
+                        + old_color.a),
+                    )
+                    pygame.draw.rect(screen, color, rect)
                 pygame.draw.rect(screen, BLOCK_COLOR, rect, 2)  # Draw the block border
                 screen.blit(text_surface, text_rect)
 
             blockRects.append(tmp)
 
         pygame.display.flip()  # Update the display
+    if not win:
+        pygame.quit()
+        return
     old_screen = screen.copy()
     while True:
         for event in pygame.event.get():
@@ -96,11 +154,11 @@ def start(board: Board):
         screen.blit(old_screen, (0, 0))
         screen.blit(
             pygame.font.Font(None, 72).render("You Win!", True, TEXT_COLOR),
-            (screen.get_width() // 2 - 100, screen.get_height() // 2 - 36)
+            (screen.get_width() // 2 - 100, screen.get_height() // 2 - 36),
         )
         screen.blit(
             pygame.font.Font(None, 36).render("Press ESC to exit.", True, TEXT_COLOR),
-            (screen.get_width() // 2 - 100, screen.get_height() // 2 + 36)
+            (screen.get_width() // 2 - 100, screen.get_height() // 2 + 36),
         )
         pygame.display.flip()
     pygame.quit()
