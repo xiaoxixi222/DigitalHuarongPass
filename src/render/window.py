@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import pygame
 from pygame.locals import * # type: ignore
 import logging
@@ -13,6 +18,11 @@ from config.render import (
     MOVE_TIME,
 )
 from board import Board
+from board.board import generate_board
+from ai.agent import DecisionTrace, NeuralAgent
+from ai.encoding import ACTION_DELTAS
+from ai.model import load_checkpoint
+from render.ai_panel import draw_action_overlay, draw_ai_panel
 
 logger = logging.getLogger("game.render")
 
@@ -32,18 +42,20 @@ def draw_board(
     *,
     win: bool = False,
     end_tick: int = 0,
+    area: pygame.Rect | None = None,
 ) -> int:
     """绘制棋盘一帧；win=True 时叠加胜利对角线高亮波。返回 block_size。"""
     screen.fill(BACKGROUND_COLOR)  # Fill the screen with the background color
     # Draw game elements here
+    draw_area = area or screen.get_rect()
     block_size = min(
         (
-            screen.get_width() // (COL_NUMBER + 2),
-            screen.get_height() // (ROW_NUMBER + 2),
+            draw_area.width // (COL_NUMBER + 2),
+            draw_area.height // (ROW_NUMBER + 2),
         )
     )
-    start_x = (screen.get_width() - (block_size * (COL_NUMBER))) // 2
-    start_y = (screen.get_height() - (block_size * (ROW_NUMBER))) // 2
+    start_x = draw_area.x + (draw_area.width - (block_size * (COL_NUMBER))) // 2
+    start_y = draw_area.y + (draw_area.height - (block_size * (ROW_NUMBER))) // 2
     blockRects.clear()
     for row in range(ROW_NUMBER):
         tmp = []
@@ -183,99 +195,158 @@ def pick_block(
     return (-1, -1)
 
 
-def start(board: Board):
+def _board_state(board: Board) -> tuple[int, ...]:
+    return tuple(value for line in board.board for value in line)
+
+
+def _reset_random_board(board: Board) -> None:
+    board.board = generate_board(COL_NUMBER, ROW_NUMBER)
+
+
+def _reset_goal_board(board: Board) -> None:
+    board.board = [
+        [i for i in range(j * COL_NUMBER + 1, (j + 1) * COL_NUMBER + 1)]
+        for j in range(ROW_NUMBER)
+    ]
+    board.board[ROW_NUMBER - 1][COL_NUMBER - 1] = -1
+
+
+def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test: bool = False):
     global move_blocks, blockRects, highlight_blocks
     pygame.init()
-    screen: pygame.Surface = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
+    screen: pygame.Surface = pygame.display.set_mode((1180, 720), pygame.RESIZABLE)
     pygame.display.set_caption("DigitalHuarongPass")
+    if smoke_test:
+        draw_board(screen, board, pygame.time.get_ticks(), area=screen.get_rect())
+        pygame.display.flip()
+        pygame.quit()
+        return
 
+    move_blocks = ((-1, -1), (-1, -1), -MOVE_TIME)
     block_num = (-1, -1)
-
-    running = True
+    ai_enabled = False
+    ai_paused = False
+    ai_step_requested = False
+    panel_visible = True
+    agent: NeuralAgent | None = None
+    model_name = "not loaded"
+    ai_error: str | None = None
+    trace: DecisionTrace | None = None
+    recent_actions: list[str] = []
     win = False
+    end_tick = 0
+    running = True
     while running:
         tick = pygame.time.get_ticks()
+        panel_width = min(380, max(0, screen.get_width() - 520)) if panel_visible else 0
+        show_panel = panel_width >= 220
+        if not show_panel:
+            panel_width = 0
+        board_area = pygame.Rect(0, 0, max(1, screen.get_width() - panel_width), screen.get_height())
         for event in pygame.event.get():
             if event.type == QUIT:
                 running = False
             elif event.type == MOUSEBUTTONDOWN:
-                # logger.info(f"Mouse button pressed at position {event.pos}")
-                if event.button != 1:
+                if event.button != 1 or ai_enabled or win:
                     continue
                 if tick - move_blocks[2] < MOVE_TIME:
                     continue
                 if block_num != (-1, -1):
-                    logger.info(f"Swapping block {block_num}")
                     result = board.dealWithSwap(block_num)
-                    logger.info(f"Result: {result}")
                     if result is not None:
-                        result = (result[1], result[0])
-                        move_blocks = (
-                            block_num,
-                            result,
-                            tick,
-                        )
+                        move_blocks = (block_num, (result[1], result[0]), tick)
+                        trace = None
                     if board.checkWin():
                         logger.info("You win!")
-                        running = False
                         win = True
+                        end_tick = tick
             elif event.type == MOUSEMOTION:
                 block_num = pick_block(event.pos, block_num)
-
             elif event.type == KEYDOWN:
                 logger.info(f"Key pressed: {pygame.key.name(event.key)}")
-                if event.key == K_ESCAPE:
-                    board.board = [
-                        [i for i in range(j * COL_NUMBER + 1, (j + 1) * COL_NUMBER + 1)]
-                        for j in range(ROW_NUMBER)
-                    ]
-                    board.board[ROW_NUMBER - 1][COL_NUMBER - 1] = -1
-                    logger.info("Resetting the board to the initial state.")
+                if event.key == K_a and not win:
+                    if ai_enabled:
+                        ai_enabled = False
+                        ai_paused = False
+                        trace = None
+                    else:
+                        try:
+                            model, metadata = load_checkpoint(model_path)
+                            agent = NeuralAgent(model, model_name=str(metadata.get("stage", model_path.name)))
+                            model_name = str(metadata.get("stage", model_path.name))
+                            ai_error = None
+                            ai_enabled = True
+                            ai_paused = False
+                            trace = None
+                        except (OSError, ValueError, RuntimeError) as exc:
+                            ai_error = str(exc)
+                            ai_enabled = False
+                            agent = None
+                elif event.key == K_SPACE and ai_enabled and not win:
+                    if ai_paused:
+                        ai_step_requested = True
+                    else:
+                        ai_paused = True
+                elif event.key == K_t:
+                    panel_visible = not panel_visible
+                elif event.key == K_r and not win:
+                    _reset_random_board(board)
+                    move_blocks = ((-1, -1), (-1, -1), tick - MOVE_TIME)
+                    trace = None
+                    recent_actions.clear()
+                elif event.key == K_ESCAPE:
+                    _reset_goal_board(board)
+                    move_blocks = ((-1, -1), (-1, -1), tick - MOVE_TIME)
+                    trace = None
+                    win = False
+                elif win:
+                    running = False
 
-        if tick - move_blocks[2] >= MOVE_TIME:
-            highlight_blocks[(block_num[1], block_num[0])] = (
-                tick  # Reset the highlight animation for this block
+        can_move = tick - move_blocks[2] >= MOVE_TIME
+        should_step = ai_enabled and agent is not None and not win and can_move and (
+            not ai_paused or ai_step_requested
+        )
+        if should_step:
+            current_state = _board_state(board)
+            trace = agent.decide(current_state, step=trace.step + 1 if trace else 0)
+            blank_row, blank_col = trace.blank_position
+            delta_row, delta_col = ACTION_DELTAS[trace.selected_action]
+            target = (blank_col + delta_col, blank_row + delta_row)
+            old_blank = board.dealWithSwap(target)
+            if old_blank is not None:
+                move_blocks = (target, (old_blank[1], old_blank[0]), tick)
+                recent_actions.append(trace.selected_action.name)
+                recent_actions[:] = recent_actions[-8:]
+            ai_step_requested = False
+            if board.checkWin():
+                win = True
+                end_tick = tick
+
+        if tick - move_blocks[2] >= MOVE_TIME and block_num != (-1, -1):
+            highlight_blocks[(block_num[1], block_num[0])] = tick
+        block_size = draw_board(screen, board, tick, win=win, end_tick=end_tick, area=board_area)
+        if ai_enabled:
+            draw_action_overlay(screen, board_area, block_size, trace)
+        if show_panel:
+            draw_ai_panel(
+                screen,
+                pygame.Rect(screen.get_width() - panel_width, 0, panel_width, screen.get_height()),
+                trace,
+                model_name=model_name,
+                paused=ai_paused,
+                error=ai_error,
+                recent_actions=recent_actions,
             )
-        draw_board(screen, board, tick)
-        pygame.display.flip()  # Update the display
-    if not win:
-        pygame.quit()
-        return
-    running = True
-    end_tick = pygame.time.get_ticks()
-    while running:
-        tick = pygame.time.get_ticks()
-        for event in pygame.event.get():
-            if event.type == QUIT:
-                running = False
-            elif event.type == MOUSEMOTION:
-                block_num = pick_block(event.pos, block_num)
-            elif event.type == KEYDOWN:
-                running = False
-
-        highlight_blocks[(block_num[1], block_num[0])] = (
-            tick  # Reset the highlight animation for this block
-        )
-        block_size = draw_board(screen, board, tick, win=True, end_tick=end_tick)
-
-        font = pygame.font.Font(None, int(block_size * 1.5))
-        text_surface = font.render("You win!", True, TEXT_COLOR)
-        font2 = pygame.font.Font(None, int(block_size * 0.5))
-        text2_surface = font2.render("Press any key to exit.", True, TEXT_COLOR)
-        tex2_rect = text2_surface.get_rect(
-            center=(screen.get_width() // 2, screen.get_height() // 2 + block_size)
-        )
-        text_rect = text_surface.get_rect(
-            center=(screen.get_width() // 2, screen.get_height() // 2 - block_size)
-        )
-        screen.blit(text_surface, text_rect)
-        screen.blit(text2_surface, tex2_rect)
-
-        pygame.display.flip()  # Update the display
+        if win:
+            font = pygame.font.Font(None, int(block_size * 1.5))
+            text_surface = font.render("You win!", True, TEXT_COLOR)
+            text_rect = text_surface.get_rect(center=(board_area.centerx, board_area.centery - block_size))
+            screen.blit(text_surface, text_rect)
+        pygame.display.flip()
     pygame.quit()
 
 
-def main() -> None:
+def main(*, model_path: Path = Path("models/best.pt"), smoke_test: bool = False) -> None:
     """控制台入口：建立棋盘、初始化日志并启动游戏窗口。"""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     logger_ = logging.getLogger("game")
@@ -286,4 +357,12 @@ def main() -> None:
     for handler in logger_.handlers:
         handler.setFormatter(formatter)
 
-    start(Board(COL_NUMBER, ROW_NUMBER))
+    start(Board(COL_NUMBER, ROW_NUMBER), model_path=model_path, smoke_test=smoke_test)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run DigitalHuarongPass")
+    parser.add_argument("--model", type=Path, default=Path("models/best.pt"))
+    parser.add_argument("--smoke-test", action="store_true")
+    args = parser.parse_args()
+    main(model_path=args.model, smoke_test=args.smoke_test)

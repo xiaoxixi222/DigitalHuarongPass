@@ -6,6 +6,12 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "pygame>=2.6.1",
+    "torch>=2.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
 ]
 
 [project.scripts]
@@ -15,8 +21,8 @@ digitalhuarongpass = "render.window:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# src 布局：把 src/ 下的 config、render、board 作为三个顶层包安装。
+# src 布局：把 src/ 下的 config、render、board、ai 作为顶层包安装。
 # 安装后 import config / import render / import board 在任意目录都可用，
 # 因此在 src/ 下按路径直接运行脚本也不会再报 No module named 'config'。
 [tool.hatch.build.targets.wheel]
-packages = ["src/config", "src/render", "src/board"]
+packages = ["src/config", "src/render", "src/board", "src/ai"]
