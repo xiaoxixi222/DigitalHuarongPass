@@ -16,8 +16,16 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .agent import DecisionTrace, NeuralAgent
-from .dataset import Example, generate_examples
+from .agent import (
+    AStarGuardedAgent,
+    DecisionAgent,
+    DecisionTrace,
+    EnsembleNeuralAgent,
+    NeuralBeamAgent,
+    NeuralAgent,
+    load_agent,
+)
+from .dataset import Example, generate_examples, generate_trajectory_examples
 from .encoding import Action, PuzzleState, encode_state, goal_state, legal_actions
 from .environment import PuzzleEnvironment
 from .model import HuarongNet, load_checkpoint, save_checkpoint
@@ -51,6 +59,26 @@ def _split_examples(
     random.Random(seed).shuffle(shuffled)
     validation_count = max(1, int(len(shuffled) * validation_ratio))
     return tuple(shuffled[validation_count:]), tuple(shuffled[:validation_count])
+
+
+def _kfold_examples(
+    examples: tuple[Example, ...], *, folds: int, seed: int
+) -> tuple[tuple[tuple[Example, ...], tuple[Example, ...]], ...]:
+    if folds < 2:
+        raise ValueError("cross-validation requires at least two folds")
+    states = [example.state for example in examples]
+    if len(states) != len(set(states)):
+        raise ValueError("cross-validation requires unique states")
+    indices = list(range(len(examples)))
+    random.Random(seed).shuffle(indices)
+    fold_indices = [indices[index::folds] for index in range(folds)]
+    result = []
+    for index in range(folds):
+        validation_indices = set(fold_indices[index])
+        validation = tuple(examples[item] for item in fold_indices[index])
+        train = tuple(examples[item] for item in indices if item not in validation_indices)
+        result.append((train, validation))
+    return tuple(result)
 
 
 def _loader(examples: Iterable[Example], batch_size: int, shuffle: bool) -> DataLoader:
@@ -130,6 +158,57 @@ def train_imitation(
     return best_model, history, final_model
 
 
+def train_cross_validation(
+    examples: tuple[Example, ...],
+    *,
+    folds: int,
+    epochs: int,
+    batch_size: int = 128,
+    learning_rate: float = 2e-3,
+    seed: int = 42,
+    device: str = "cpu",
+) -> tuple[list[HuarongNet], list[dict[str, Any]], list[list[dict[str, float]]]]:
+    models: list[HuarongNet] = []
+    fold_metrics: list[dict[str, Any]] = []
+    histories: list[list[dict[str, float]]] = []
+    for fold_index, (train_examples, validation_examples) in enumerate(
+        _kfold_examples(examples, folds=folds, seed=seed), start=1
+    ):
+        _set_seed(seed + fold_index)
+        model, history, final_model = train_imitation(
+            train_examples,
+            validation_examples,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            device=device,
+        )
+        validation_evaluation, _ = evaluate_agent(model, validation_examples, device=device)
+        final_evaluation, _ = evaluate_agent(final_model, validation_examples, device=device)
+        selected_model = model
+        selected_evaluation = validation_evaluation
+        if final_evaluation["solve_rate"] > validation_evaluation["solve_rate"] or (
+            final_evaluation["solve_rate"] == validation_evaluation["solve_rate"]
+            and (final_evaluation["average_steps"] or float("inf"))
+            < (validation_evaluation["average_steps"] or float("inf"))
+        ):
+            selected_model = final_model
+            selected_evaluation = final_evaluation
+        models.append(selected_model)
+        histories.append(history)
+        fold_metrics.append(
+            {
+                "fold": fold_index,
+                "train": len(train_examples),
+                "validation": len(validation_examples),
+                "validation_evaluation": validation_evaluation,
+                "final_evaluation": final_evaluation,
+                "selected_evaluation": selected_evaluation,
+            }
+        )
+    return models, fold_metrics, histories
+
+
 def _trace_to_dict(trace: DecisionTrace) -> dict[str, Any]:
     return {
         "state": list(trace.state),
@@ -139,6 +218,9 @@ def _trace_to_dict(trace: DecisionTrace) -> dict[str, Any]:
         "inference_ms": trace.inference_ms,
         "step": trace.step,
         "hidden_summary": list(trace.hidden_summary),
+        "fold_agreement": trace.fold_agreement,
+        "fallback_used": trace.fallback_used,
+        "decision_source": trace.decision_source,
         "candidates": [
             {
                 "action": candidate.action.name,
@@ -153,23 +235,27 @@ def _trace_to_dict(trace: DecisionTrace) -> dict[str, Any]:
     }
 
 
-def evaluate_agent(
-    model: HuarongNet,
+def evaluate_decider(
+    agent: DecisionAgent,
     examples: tuple[Example, ...],
     *,
     max_steps: int = 120,
     device: str = "cpu",
 ) -> tuple[dict[str, Any], list[DecisionTrace]]:
-    agent = NeuralAgent(model, device=device)
     solved = 0
     illegal = 0
     decisions = 0
     first_action_matches = 0
     legal_decisions = 0
+    fallback_decisions = 0
+    agreement_values: list[float] = []
     steps_taken: list[int] = []
     inference_times: list[float] = []
     traces: list[DecisionTrace] = []
     for example in examples:
+        reset = getattr(agent, "reset", None)
+        if callable(reset):
+            reset()
         environment = PuzzleEnvironment(example.state, max_steps=max_steps)
         for step in range(max_steps):
             trace = agent.decide(environment.state, step=step)
@@ -179,6 +265,8 @@ def evaluate_agent(
             if len(traces) < 3:
                 traces.append(trace)
             inference_times.append(trace.inference_ms)
+            fallback_decisions += int(trace.fallback_used)
+            agreement_values.append(trace.fold_agreement)
             transition = environment.step(trace.selected_action)
             if not transition.legal:
                 illegal += 1
@@ -203,11 +291,27 @@ def evaluate_agent(
             "average_inference_ms": sum(inference_times) / len(inference_times)
             if inference_times
             else 0.0,
+            "fallback_rate": fallback_decisions / max(1, decisions),
+            "average_fold_agreement": sum(agreement_values) / len(agreement_values)
+            if agreement_values
+            else 1.0,
             "astar_average_steps": sum(example.remaining_steps for example in examples) / count
             if count
             else None,
         },
         traces,
+    )
+
+
+def evaluate_agent(
+    model: HuarongNet,
+    examples: tuple[Example, ...],
+    *,
+    max_steps: int = 120,
+    device: str = "cpu",
+) -> tuple[dict[str, Any], list[DecisionTrace]]:
+    return evaluate_decider(
+        NeuralAgent(model, device=device), examples, max_steps=max_steps, device=device
     )
 
 
@@ -235,6 +339,77 @@ def evaluate_random(
     }
 
 
+def evaluate_depth_buckets(
+    agent: DecisionAgent,
+    *,
+    games_per_bucket: int,
+    seed: int,
+    depths: tuple[int, ...] = (12, 16, 20, 24),
+    max_steps: int = 160,
+    device: str = "cpu",
+) -> dict[str, dict[str, Any]]:
+    """Evaluate one pure decision agent on independently sampled depth buckets."""
+    results: dict[str, dict[str, Any]] = {}
+    for index, depth in enumerate(depths):
+        examples = generate_examples(
+            games_per_bucket,
+            seed=seed + index,
+            min_depth=depth,
+            max_depth=depth,
+        )
+        evaluation, _ = evaluate_decider(
+            agent, examples, max_steps=max_steps, device=device
+        )
+        results[str(depth)] = evaluation
+    return results
+
+
+def _legal_action_mask(state: PuzzleState) -> torch.Tensor:
+    """Return a boolean mask for actions that can be applied to ``state``.
+
+    DQN targets must only bootstrap from actions that the environment can
+    execute.  Keeping this conversion in one place also makes replay entries
+    independent of the feature encoding (which does not expose legal moves).
+    """
+
+    mask = torch.zeros(len(Action), dtype=torch.bool)
+    for action in legal_actions(state):
+        mask[int(action)] = True
+    return mask
+
+
+def _double_dqn_targets(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    online_q: torch.Tensor,
+    target_q: torch.Tensor,
+    next_legal_mask: torch.Tensor,
+    *,
+    gamma: float,
+) -> torch.Tensor:
+    """Compute masked Double-DQN bootstrap targets.
+
+    The online network chooses the next action, while the target network
+    evaluates it.  The action selection is masked before ``argmax`` so an
+    out-of-bounds movement can never inflate a target value.
+    """
+
+    if online_q.shape != target_q.shape:
+        raise ValueError("online and target Q tensors must have the same shape")
+    if online_q.ndim != 2 or online_q.shape[1] != len(Action):
+        raise ValueError("Q tensors must have shape (batch, action_count)")
+    if next_legal_mask.shape != online_q.shape:
+        raise ValueError("next-state legal-action mask must match Q tensor shape")
+
+    legal_mask = next_legal_mask.to(dtype=torch.bool)
+    if not torch.all(legal_mask.any(dim=1)):
+        raise ValueError("each next state must have at least one legal action")
+    masked_online_q = online_q.masked_fill(~legal_mask, float("-inf"))
+    next_actions = masked_online_q.argmax(dim=1)
+    next_values = target_q.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+    return rewards + gamma * (1.0 - dones) * next_values
+
+
 def train_dqn(
     model: HuarongNet,
     starts: tuple[Example, ...],
@@ -250,7 +425,9 @@ def train_dqn(
     target_model = HuarongNet()
     target_model.load_state_dict(model.state_dict())
     target_model.to(device).eval()
-    replay: deque[tuple[torch.Tensor, Action, float, torch.Tensor, bool]] = deque(maxlen=20_000)
+    replay: deque[
+        tuple[torch.Tensor, Action, float, torch.Tensor, torch.Tensor, bool]
+    ] = deque(maxlen=20_000)
     history: list[dict[str, float]] = []
     gamma = 0.99
     epsilon = 1.0
@@ -273,29 +450,41 @@ def train_dqn(
                     _, q_values = model(state_features.unsqueeze(0).to(device))
                 action = max(legal, key=lambda candidate: float(q_values[0, int(candidate)].item()))
             transition = environment.step(action)
+            next_state_features = encode_state(transition.state)
+            next_legal_mask = _legal_action_mask(transition.state)
             replay.append(
                 (
                     state_features,
                     action,
                     transition.reward,
-                    encode_state(transition.state),
+                    next_state_features,
+                    next_legal_mask,
                     transition.done,
                 )
             )
             episode_reward += transition.reward
             if len(replay) >= 64:
                 batch = rng.sample(replay, 32)
-                states, actions, rewards, next_states, dones = zip(*batch)
+                states, actions, rewards, next_states, next_legal_masks, dones = zip(*batch)
                 state_tensor = torch.stack(states).to(device)
                 next_tensor = torch.stack(next_states).to(device)
+                next_legal_mask_tensor = torch.stack(next_legal_masks).to(device)
                 action_tensor = torch.tensor([int(action) for action in actions], device=device)
                 reward_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
                 done_tensor = torch.tensor(dones, dtype=torch.float32, device=device)
                 _, q_values = model(state_tensor)
                 selected = q_values.gather(1, action_tensor.unsqueeze(1)).squeeze(1)
                 with torch.no_grad():
-                    next_q = target_model(next_tensor)[1]
-                    targets = reward_tensor + gamma * (1.0 - done_tensor) * next_q.max(dim=1).values
+                    online_next_q = model(next_tensor)[1]
+                    target_next_q = target_model(next_tensor)[1]
+                    targets = _double_dqn_targets(
+                        reward_tensor,
+                        done_tensor,
+                        online_next_q,
+                        target_next_q,
+                        next_legal_mask_tensor,
+                        gamma=gamma,
+                    )
                 loss = nn.functional.smooth_l1_loss(selected, targets)
                 optimizer.zero_grad()
                 loss.backward()
@@ -372,6 +561,8 @@ def write_training_report(
         f"| Legal-action accuracy | {evaluation.get('legal_action_accuracy', 0):.2%} |",
         f"| Illegal action rate | {evaluation.get('illegal_action_rate', 0):.2%} |",
         f"| Average inference time | {evaluation.get('average_inference_ms', 0):.3f} ms |",
+        f"| Average fold agreement | {evaluation.get('average_fold_agreement', 1):.2%} |",
+        f"| Fallback rate | {evaluation.get('fallback_rate', 0):.2%} |",
         "",
         "## Baselines And Checkpoint Selection",
         "",
@@ -407,6 +598,59 @@ def write_training_report(
         "",
         ]
     )
+    fold_metrics = metrics.get("cross_validation", {}).get("folds", [])
+    if fold_metrics:
+        insert_at = lines.index("## Training History")
+        fold_lines = [
+            "## Cross-Validation",
+            "",
+            "Each state appears in exactly one validation fold. The ensemble averages all fold models at inference time.",
+            "",
+            "| Fold | Train states | Validation states | Validation solve rate | First-action accuracy |",
+            "| ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for fold in fold_metrics:
+            evaluation = fold.get("selected_evaluation", {})
+            fold_lines.append(
+                f"| {fold.get('fold', '?')} | {fold.get('train', 0)} | {fold.get('validation', 0)} | {evaluation.get('solve_rate', 0):.2%} | {evaluation.get('action_accuracy', 0):.2%} |"
+            )
+        fold_lines.extend([""])
+        lines[insert_at:insert_at] = fold_lines
+    guarded = metrics.get("guarded_evaluation")
+    if guarded:
+        insert_at = lines.index("## Training History")
+        guarded_lines = [
+            "## Guarded Evaluation",
+            "",
+            "The pure ensemble remains the primary neural result. The guarded result uses A* only when the ensemble confidence or fold agreement is below the recorded threshold.",
+            "",
+            "| Metric | Value |",
+            "| --- | ---: |",
+            f"| Solve rate | {guarded.get('solve_rate', 0):.2%} |",
+            f"| Average steps | {guarded.get('average_steps', 'n/a')} |",
+            f"| Fallback rate | {guarded.get('fallback_rate', 0):.2%} |",
+            "",
+        ]
+        lines[insert_at:insert_at] = guarded_lines
+    depth_buckets = metrics.get("depth_buckets", {})
+    if depth_buckets:
+        insert_at = lines.index("## Training History")
+        depth_lines = [
+            "## Pure Neural Depth Buckets",
+            "",
+            "These evaluations disable the A* guard and measure the deployed neural ensemble directly.",
+            "",
+            "| Scramble depth | Games | Solve rate | Average steps | Illegal action rate | Fallback rate |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for depth, bucket in sorted(depth_buckets.items(), key=lambda item: int(item[0])):
+            depth_lines.append(
+                f"| {depth} | {bucket.get('games', 0)} | {bucket.get('solve_rate', 0):.2%} | "
+                f"{bucket.get('average_steps', 'n/a')} | {bucket.get('illegal_action_rate', 0):.2%} | "
+                f"{bucket.get('fallback_rate', 0):.2%} |"
+            )
+        depth_lines.extend([""])
+        lines[insert_at:insert_at] = depth_lines
     for index, trace in enumerate(traces, start=1):
         lines.extend(
             [
@@ -435,6 +679,8 @@ def run_training(
     epochs: int = 30,
     episodes: int = 1000,
     eval_games: int = 100,
+    folds: int = 5,
+    train_max_depth: int = 1000,
     seed: int = 42,
     output_root: Path = Path("."),
     device: str = "cpu",
@@ -460,10 +706,13 @@ def run_training(
             "epochs": epochs,
             "episodes": episodes,
             "eval_games": eval_games,
+            "folds": folds,
+            "train_max_depth": train_max_depth if stage == "sixth-generation" else None,
             "board": "4x4",
         },
     }
 
+    agent: DecisionAgent | None = None
     if stage == "imitation":
         examples = generate_examples(samples, seed=seed, min_depth=2, max_depth=12)
         train_examples, validation_examples = _split_examples(examples, seed)
@@ -485,16 +734,17 @@ def run_training(
         ):
             final_path = model_dir / "final.pt"
             save_checkpoint(final_path, final_model, {"stage": "imitation-final", "seed": seed})
-            selected_path = model_dir / "best.pt"
+            selected_path = model_dir / "第五代超级数字华容道之神.pt"
             shutil.copyfile(final_path, selected_path)
             model = final_model
             metrics["selection_reason"] = "Final epoch improved held-out solving over the validation-best checkpoint."
         else:
-            selected_path = model_dir / "best.pt"
+            selected_path = model_dir / "第五代超级数字华容道之神.pt"
             shutil.copyfile(validation_path, selected_path)
             metrics["selection_reason"] = "Validation-best checkpoint retained because it solved at least as many held-out states."
         checkpoint_path = model_dir / "imitation.pt"
         shutil.copyfile(selected_path, checkpoint_path)
+        agent = NeuralAgent(model, device=device)
         metrics["validation_checkpoint_evaluation"] = validation_evaluation
         metrics["final_checkpoint_evaluation"] = final_evaluation
         metrics["dataset"] = {
@@ -524,17 +774,193 @@ def run_training(
         baseline_model, _ = load_checkpoint(checkpoint, device=device)
         baseline_evaluation, _ = evaluate_agent(baseline_model, eval_examples, device=device)
         metrics["baseline_evaluation"] = baseline_evaluation
+        agent = NeuralAgent(model, device=device)
+    elif stage in ("cross-validation", "crossval"):
+        examples = generate_examples(samples, seed=seed, min_depth=2, max_depth=16)
+        models, fold_metrics, histories = train_cross_validation(
+            examples,
+            folds=folds,
+            epochs=epochs,
+            seed=seed,
+            device=device,
+        )
+        fold_names: list[str] = []
+        for fold_index, fold_model in enumerate(models, start=1):
+            fold_name = f"cv-fold-{fold_index}.pt"
+            fold_names.append(fold_name)
+            save_checkpoint(
+                model_dir / fold_name,
+                fold_model,
+                {
+                    "stage": "cross-validation-fold",
+                    "seed": seed,
+                    "fold": fold_index,
+                    "folds": folds,
+                },
+            )
+        ensemble = EnsembleNeuralAgent(models, device=device)
+        guarded_agent = AStarGuardedAgent(ensemble)
+        pure_evaluation, _ = evaluate_decider(ensemble, eval_examples, device=device)
+        guarded_evaluation, _ = evaluate_decider(guarded_agent, eval_examples, device=device)
+        selected_path = model_dir / "第五代超级数字华容道之神.pt"
+        save_checkpoint(
+            selected_path,
+            models[0],
+            {
+                "stage": "cross-validation-ensemble",
+                "seed": seed,
+                "folds": folds,
+                "ensemble_checkpoints": fold_names,
+                "astar_guard": True,
+                "guard_confidence": guarded_agent.confidence_threshold,
+                "guard_agreement": guarded_agent.agreement_threshold,
+            },
+        )
+        checkpoint_path = selected_path
+        model = models[0]
+        agent = ensemble
+        metrics["dataset"] = {
+            "requested": samples,
+            "train": len(examples),
+            "validation": len(examples) // folds,
+            "label_failures": 0,
+        }
+        metrics["cross_validation"] = {"folds": fold_metrics, "histories": histories}
+        metrics["guarded_evaluation"] = guarded_evaluation
+        history = [{"folds": folds, "epochs": epochs}]
+        metrics["selection_reason"] = (
+            "Five state-disjoint fold models were averaged for the primary neural evaluation; "
+            "the checkpoint metadata enables the A* guard in the interactive app."
+        )
+    elif stage == "sixth-generation":
+        if train_max_depth < 2:
+            raise ValueError("train_max_depth must be at least 2")
+        examples = generate_trajectory_examples(
+            samples,
+            seed=seed,
+            min_depth=2,
+            max_depth=train_max_depth,
+        )
+        models, fold_metrics, histories = train_cross_validation(
+            examples,
+            folds=folds,
+            epochs=epochs,
+            seed=seed,
+            device=device,
+        )
+        fold_names: list[str] = []
+        for fold_index, fold_model in enumerate(models, start=1):
+            fold_name = f"sixth-generation-fold-{fold_index}.pt"
+            fold_names.append(fold_name)
+            save_checkpoint(
+                model_dir / fold_name,
+                fold_model,
+                {
+                    "stage": "sixth-generation-fold",
+                    "seed": seed,
+                    "fold": fold_index,
+                    "folds": folds,
+                    "train_min_depth": 2,
+                    "train_max_depth": train_max_depth,
+                    "astar_guard": False,
+                    "neural_planner": "beam",
+                    "beam_width": 64,
+                    "beam_horizon": 80,
+                },
+            )
+        # Preserve the strong fifth-generation shallow-policy folds as frozen
+        # members of the sixth-generation ensemble.  The newly trained deep
+        # folds add coverage for harder states without erasing the reliable
+        # shallow behavior learned previously.
+        base_models: list[HuarongNet] = []
+        base_names: list[str] = []
+        for fold_index in range(1, folds + 1):
+            source = model_dir / f"cv-fold-{fold_index}.pt"
+            if not source.exists():
+                continue
+            base_name = f"sixth-generation-base-fold-{fold_index}.pt"
+            destination = model_dir / base_name
+            shutil.copyfile(source, destination)
+            base_model, _ = load_checkpoint(destination, device=device)
+            base_models.append(base_model)
+            base_names.append(base_name)
+        ensemble_models = base_models + models
+        ensemble = EnsembleNeuralAgent(ensemble_models, device=device)
+        ensemble_names = base_names + fold_names
+        selected_path = model_dir / "第七代飞天数字华容道享受者.pt"
+        save_checkpoint(
+            selected_path,
+            models[0],
+            {
+                "stage": "sixth-generation",
+                "seed": seed,
+                "folds": folds,
+                "train_min_depth": 2,
+                "train_max_depth": train_max_depth,
+                "ensemble_checkpoints": ensemble_names,
+                "astar_guard": False,
+                "offline_teacher": "weighted A*",
+                "display_name": "第七代飞天数字华容道享受者",
+                "neural_planner": "beam",
+                "beam_width": 64,
+                "beam_horizon": 80,
+            },
+        )
+        checkpoint_path = selected_path
+        agent = NeuralBeamAgent(
+            ensemble,
+            beam_width=64,
+            horizon=80,
+        )
+        metrics["dataset"] = {
+            "requested": samples,
+            "train": len(examples),
+            "validation": len(examples) // folds,
+            "label_failures": 0,
+            "min_depth": 2,
+            "max_depth": train_max_depth,
+        }
+        metrics["cross_validation"] = {"folds": fold_metrics, "histories": histories}
+        metrics["depth_buckets"] = evaluate_depth_buckets(
+            agent,
+            games_per_bucket=max(1, min(eval_games, 100)),
+            seed=seed + 1000,
+            device=device,
+        )
+        history = [{"folds": folds, "epochs": epochs}]
+        metrics["selection_reason"] = (
+            "Selected a pure neural ensemble combining frozen fifth-generation folds with five new folds "
+            "trained on deeper offline teacher trajectories; the checkpoint explicitly disables the A* runtime guard."
+        )
     elif stage == "eval-only":
         if checkpoint is None:
             raise ValueError("--checkpoint is required for eval-only stage")
-        model, metadata = load_checkpoint(checkpoint, device=device)
+        agent, metadata = load_agent(checkpoint, device=device, use_guard=False)
         metrics["dataset"] = {"requested": eval_games, "evaluation": eval_games, "label_failures": 0}
         history = [{"loaded_checkpoint": str(checkpoint), "stage": metadata.get("stage", "unknown")}]
         checkpoint_path = Path(checkpoint)
+        if metadata.get("stage") == "sixth-generation":
+            metrics["depth_buckets"] = evaluate_depth_buckets(
+                agent,
+                games_per_bucket=max(1, min(eval_games, 100)),
+                seed=seed + 1000,
+                device=device,
+            )
+        if metadata.get("astar_guard"):
+            guarded_agent = AStarGuardedAgent(
+                agent,
+                confidence_threshold=float(metadata.get("guard_confidence", 0.75)),
+                agreement_threshold=float(metadata.get("guard_agreement", 0.6)),
+            )
+            metrics["guarded_evaluation"], _ = evaluate_decider(
+                guarded_agent, eval_examples, device=device
+            )
     else:
         raise ValueError(f"unknown training stage: {stage}")
 
-    evaluation, traces = evaluate_agent(model, eval_examples, device=device)
+    if agent is None:
+        raise RuntimeError("training stage did not produce a decision agent")
+    evaluation, traces = evaluate_decider(agent, eval_examples, device=device)
     evaluation["random_baseline"] = evaluate_random(eval_examples, seed=seed + 2000)
     metrics["evaluation"] = evaluation
     metrics["history"] = history
@@ -550,7 +976,7 @@ def run_training(
                 < (baseline["average_steps"] or float("inf"))
             )
         )
-        selected_path = model_dir / "best.pt"
+        selected_path = model_dir / "第五代超级数字华容道之神.pt"
         if dqn_is_better:
             shutil.copyfile(checkpoint_path, selected_path)
             metrics["selection_reason"] = "DQN improved held-out solve rate or average steps."
@@ -564,12 +990,30 @@ def run_training(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train and evaluate the neural solver")
-    parser.add_argument("--stage", choices=("imitation", "dqn", "eval-only"), default="imitation")
+    parser.add_argument(
+        "--stage",
+        choices=(
+            "imitation",
+            "dqn",
+            "cross-validation",
+            "crossval",
+            "sixth-generation",
+            "eval-only",
+        ),
+        default="imitation",
+    )
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--samples", type=int, default=2500)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--eval-games", type=int, default=100)
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument(
+        "--train-max-depth",
+        type=int,
+        default=1000,
+        help="maximum random-walk depth used for sixth-generation teacher data",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-root", type=Path, default=Path("."))
     parser.add_argument("--device", default="cpu")

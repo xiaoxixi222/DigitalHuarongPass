@@ -19,9 +19,8 @@ from config.render import (
 )
 from board import Board
 from board.board import generate_board
-from ai.agent import DecisionTrace, NeuralAgent
+from ai.agent import DecisionAgent, DecisionTrace, load_agent
 from ai.encoding import ACTION_DELTAS
-from ai.model import load_checkpoint
 from render.ai_panel import draw_action_overlay, draw_ai_panel
 
 logger = logging.getLogger("game.render")
@@ -33,6 +32,30 @@ move_blocks: tuple[tuple[int, int], tuple[int, int], int] = (
     (-1, -1),
     -MOVE_TIME,
 )  # 记录上一次移动的方块坐标和移动距离。
+
+
+_MODEL_OPTIONS: tuple[tuple[str, Path], ...] = (
+    ("第七代飞天数字华容道享受者", Path("models/第七代飞天数字华容道享受者.pt")),
+    ("第六代无拐杖数字华容道之神", Path("models/第六代无拐杖数字华容道之神.pt")),
+    ("第五代超级数字华容道之神", Path("models/第五代超级数字华容道之神.pt")),
+    ("DQN 微调模型", Path("models/dqn.pt")),
+    ("监督训练模型", Path("models/final.pt")),
+)
+
+
+def _available_model_options(model_path: Path) -> tuple[tuple[str, Path], ...]:
+    """Return selectable model files, keeping a custom CLI path visible."""
+    options = [option for option in _MODEL_OPTIONS if option[1].exists()]
+    if model_path.exists() and all(path != model_path for _, path in options):
+        options.insert(0, (model_path.stem, model_path))
+    return tuple(options)
+
+
+def _model_option_label(model_path: Path, options: tuple[tuple[str, Path], ...]) -> str:
+    for label, path in options:
+        if path == model_path:
+            return label
+    return model_path.stem
 
 
 def draw_board(
@@ -211,7 +234,13 @@ def _reset_goal_board(board: Board) -> None:
     board.board[ROW_NUMBER - 1][COL_NUMBER - 1] = -1
 
 
-def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test: bool = False):
+def _reset_agent_history(agent: DecisionAgent | None) -> None:
+    reset = getattr(agent, "reset", None)
+    if callable(reset):
+        reset()
+
+
+def start(board: Board, *, model_path: Path = Path("models/第七代飞天数字华容道享受者.pt"), smoke_test: bool = False):
     global move_blocks, blockRects, highlight_blocks
     pygame.init()
     screen: pygame.Surface = pygame.display.set_mode((1180, 720), pygame.RESIZABLE)
@@ -228,8 +257,12 @@ def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test
     ai_paused = False
     ai_step_requested = False
     panel_visible = True
-    agent: NeuralAgent | None = None
-    model_name = "not loaded"
+    agent: DecisionAgent | None = None
+    model_options = _available_model_options(model_path)
+    model_name = _model_option_label(model_path, model_options)
+    model_dropdown_open = False
+    selector_rect = pygame.Rect(0, 0, 0, 0)
+    option_rects: tuple[pygame.Rect, ...] = ()
     ai_error: str | None = None
     trace: DecisionTrace | None = None
     recent_actions: list[str] = []
@@ -246,8 +279,36 @@ def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test
         for event in pygame.event.get():
             if event.type == QUIT:
                 running = False
-            elif event.type == MOUSEBUTTONDOWN:
-                if event.button != 1 or ai_enabled or win:
+            elif event.type == MOUSEBUTTONDOWN and event.button == 1:
+                if show_panel and selector_rect.collidepoint(event.pos):
+                    model_dropdown_open = not model_dropdown_open
+                    continue
+                if model_dropdown_open:
+                    selected_index = next(
+                        (index for index, rect in enumerate(option_rects) if rect.collidepoint(event.pos)),
+                        None,
+                    )
+                    if selected_index is not None:
+                        selected_label, selected_path = model_options[selected_index]
+                        was_enabled = ai_enabled
+                        try:
+                            loaded_agent, metadata = load_agent(selected_path, use_guard=False)
+                            agent = loaded_agent  # type: ignore[assignment]
+                            _reset_agent_history(agent)
+                            model_path = selected_path
+                            model_name = str(metadata.get("display_name") or selected_label)
+                            ai_error = None
+                            trace = None
+                            recent_actions.clear()
+                            ai_enabled = was_enabled
+                            ai_paused = False
+                        except (OSError, ValueError, RuntimeError) as exc:
+                            ai_error = str(exc)
+                            ai_enabled = False
+                            agent = None
+                    model_dropdown_open = False
+                    continue
+                if ai_enabled or win:
                     continue
                 if tick - move_blocks[2] < MOVE_TIME:
                     continue
@@ -271,9 +332,14 @@ def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test
                         trace = None
                     else:
                         try:
-                            model, metadata = load_checkpoint(model_path)
-                            agent = NeuralAgent(model, model_name=str(metadata.get("stage", model_path.name)))
-                            model_name = str(metadata.get("stage", model_path.name))
+                            # The seventh-generation model is fully neural at runtime.
+                            # A* remains an offline training teacher only.
+                            loaded_agent, metadata = load_agent(model_path, use_guard=False)
+                            agent = loaded_agent  # type: ignore[assignment]
+                            _reset_agent_history(agent)
+                            model_name = str(
+                                metadata.get("display_name", metadata.get("stage", model_path.name))
+                            )
                             ai_error = None
                             ai_enabled = True
                             ai_paused = False
@@ -291,11 +357,13 @@ def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test
                     panel_visible = not panel_visible
                 elif event.key == K_r and not win:
                     _reset_random_board(board)
+                    _reset_agent_history(agent)
                     move_blocks = ((-1, -1), (-1, -1), tick - MOVE_TIME)
                     trace = None
                     recent_actions.clear()
                 elif event.key == K_ESCAPE:
                     _reset_goal_board(board)
+                    _reset_agent_history(agent)
                     move_blocks = ((-1, -1), (-1, -1), tick - MOVE_TIME)
                     trace = None
                     win = False
@@ -328,7 +396,7 @@ def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test
         if ai_enabled:
             draw_action_overlay(screen, board_area, block_size, trace)
         if show_panel:
-            draw_ai_panel(
+            selector_rect, option_rects = draw_ai_panel(
                 screen,
                 pygame.Rect(screen.get_width() - panel_width, 0, panel_width, screen.get_height()),
                 trace,
@@ -336,7 +404,12 @@ def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test
                 paused=ai_paused,
                 error=ai_error,
                 recent_actions=recent_actions,
+                model_options=model_options,
+                model_dropdown_open=model_dropdown_open,
             )
+        else:
+            selector_rect = pygame.Rect(0, 0, 0, 0)
+            option_rects = ()
         if win:
             font = pygame.font.Font(None, int(block_size * 1.5))
             text_surface = font.render("You win!", True, TEXT_COLOR)
@@ -346,7 +419,7 @@ def start(board: Board, *, model_path: Path = Path("models/best.pt"), smoke_test
     pygame.quit()
 
 
-def main(*, model_path: Path = Path("models/best.pt"), smoke_test: bool = False) -> None:
+def main(*, model_path: Path = Path("models/第七代飞天数字华容道享受者.pt"), smoke_test: bool = False) -> None:
     """控制台入口：建立棋盘、初始化日志并启动游戏窗口。"""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     logger_ = logging.getLogger("game")
@@ -362,7 +435,7 @@ def main(*, model_path: Path = Path("models/best.pt"), smoke_test: bool = False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run DigitalHuarongPass")
-    parser.add_argument("--model", type=Path, default=Path("models/best.pt"))
+    parser.add_argument("--model", type=Path, default=Path("models/第七代飞天数字华容道享受者.pt"))
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
     main(model_path=args.model, smoke_test=args.smoke_test)

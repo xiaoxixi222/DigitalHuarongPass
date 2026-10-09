@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
+from pathlib import Path
 
 import pygame
 
@@ -16,11 +18,50 @@ ACCENT_COLOR = (32, 112, 210)
 GOOD_COLOR = (35, 150, 102)
 BAD_COLOR = (205, 78, 78)
 BAR_BACKGROUND = (220, 226, 234)
+ACTION_LABELS = {
+    "UP": "上",
+    "DOWN": "下",
+    "LEFT": "左",
+    "RIGHT": "右",
+}
+MODEL_LABELS = {
+    "sixth-generation": "第六代无拐杖数字华容道之神",
+    "第七代飞天数字华容道享受者.pt": "第七代飞天数字华容道享受者",
+    "sixth-generation-fold": "第六代深度折模型",
+    "cross-validation-ensemble": "第五代超级数字华容道之神",
+    "cross-validation-fold": "交叉验证模型",
+    "imitation-validation": "监督验证模型",
+    "imitation-final": "监督训练模型",
+    "dqn": "强化学习微调模型",
+    "neural solver": "神经网络求解器",
+    "untrained": "未训练模型",
+    "第五代超级数字华容道之神.pt": "第五代超级数字华容道之神",
+    "not loaded": "未加载模型",
+}
+
+
+@lru_cache(maxsize=None)
+def _font(size: int) -> pygame.font.Font:
+    for font_path in (
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ):
+        if Path(font_path).exists():
+            return pygame.font.Font(font_path, size)
+    return pygame.font.SysFont("PingFang SC", size) or pygame.font.Font(None, size)
+
+
+def _action_label(action: str) -> str:
+    return ACTION_LABELS.get(action, action)
+
+
+def _model_label(model_name: str) -> str:
+    return MODEL_LABELS.get(model_name, model_name)
 
 
 def _label(surface: pygame.Surface, text: str, position: tuple[int, int], size: int = 20, color=TEXT_COLOR) -> None:
-    font = pygame.font.Font(None, size)
-    surface.blit(font.render(text, True, color), position)
+    surface.blit(_font(size).render(text, True, color), position)
 
 
 def _bar(surface: pygame.Surface, rect: pygame.Rect, fraction: float, color) -> None:
@@ -35,32 +76,92 @@ def draw_ai_panel(
     area: pygame.Rect,
     trace: DecisionTrace | None,
     *,
-    model_name: str = "neural solver",
+    model_name: str = "神经网络求解器",
     paused: bool = False,
     error: str | None = None,
     recent_actions: Sequence[str] = (),
-) -> None:
+    model_options: Sequence[tuple[str, Path]] = (),
+    model_dropdown_open: bool = False,
+) -> tuple[pygame.Rect, tuple[pygame.Rect, ...]]:
     pygame.draw.rect(screen, PANEL_BACKGROUND, area)
     pygame.draw.line(screen, PANEL_BORDER, area.topleft, area.bottomleft, 2)
     x = area.x + 18
     width = area.width - 36
-    _label(screen, "AI DECISION TRACE", (x, area.y + 16), 25)
-    _label(screen, f"model: {model_name}", (x, area.y + 48), 18, MUTED_COLOR)
-    status = "PAUSED / STEP" if paused else "RUNNING"
-    _label(screen, f"status: {status}", (x, area.y + 70), 18, ACCENT_COLOR if not paused else MUTED_COLOR)
-    if error:
-        _label(screen, "AI unavailable", (x, area.y + 106), 21, BAD_COLOR)
-        _label(screen, error[:38], (x, area.y + 132), 16, BAD_COLOR)
-        return
-    if trace is None:
-        _label(screen, "Press A to enable AI", (x, area.y + 118), 21, MUTED_COLOR)
-        _label(screen, "Press T to hide this panel", (x, area.y + 148), 17, MUTED_COLOR)
-        return
+    _label(screen, "人工智能决策轨迹", (x, area.y + 16), 22)
+    selector_rect = pygame.Rect(x, area.y + 43, width, 32)
+    pygame.draw.rect(screen, (255, 255, 255), selector_rect, border_radius=4)
+    pygame.draw.rect(screen, PANEL_BORDER, selector_rect, 1, border_radius=4)
+    selected_label = _model_label(model_name)
+    if len(selected_label) > 27:
+        selected_label = selected_label[:26] + "…"
+    _label(screen, f"模型：{selected_label}", (selector_rect.x + 10, selector_rect.y + 7), 16, TEXT_COLOR)
+    arrow_x = selector_rect.right - 19
+    arrow_y = selector_rect.centery
+    arrow = (
+        [(arrow_x - 5, arrow_y - 2), (arrow_x + 5, arrow_y - 2), (arrow_x, arrow_y + 4)]
+        if not model_dropdown_open
+        else [(arrow_x - 5, arrow_y + 3), (arrow_x + 5, arrow_y + 3), (arrow_x, arrow_y - 4)]
+    )
+    pygame.draw.polygon(screen, MUTED_COLOR, arrow)
+    option_rects: list[pygame.Rect] = []
+    if model_dropdown_open:
+        for index, (_label_text, _path) in enumerate(model_options):
+            option_rect = pygame.Rect(
+                selector_rect.x,
+                selector_rect.bottom + index * 30,
+                selector_rect.width,
+                30,
+            )
+            option_rects.append(option_rect)
 
-    _label(screen, f"step {trace.step:03d}   confidence {trace.confidence:.1%}", (x, area.y + 104), 19)
-    _label(screen, f"inference {trace.inference_ms:.2f} ms", (x, area.y + 128), 17, MUTED_COLOR)
-    _label(screen, "CANDIDATE ACTIONS", (x, area.y + 170), 18, MUTED_COLOR)
-    row_top = area.y + 196
+    def draw_options() -> None:
+        for option_rect, (label, _path) in zip(option_rects, model_options):
+            pygame.draw.rect(screen, (255, 255, 255), option_rect)
+            pygame.draw.rect(screen, PANEL_BORDER, option_rect, 1)
+            option_label = label if len(label) <= 29 else label[:28] + "…"
+            _label(screen, option_label, (option_rect.x + 10, option_rect.y + 6), 15, TEXT_COLOR)
+    status = "已暂停 / 单步" if paused else "运行中"
+    _label(screen, f"状态：{status}", (x, area.y + 84), 17, ACCENT_COLOR if not paused else MUTED_COLOR)
+    if error:
+        _label(screen, "人工智能不可用", (x, area.y + 126), 19, BAD_COLOR)
+        _label(screen, f"错误：{error[:34]}", (x, area.y + 152), 16, BAD_COLOR)
+        draw_options()
+        return selector_rect, tuple(option_rects)
+    if trace is None:
+        _label(screen, "按 A 键启动人工智能", (x, area.y + 138), 19, MUTED_COLOR)
+        _label(screen, "按 T 键隐藏面板", (x, area.y + 168), 17, MUTED_COLOR)
+        draw_options()
+        return selector_rect, tuple(option_rects)
+
+    source = (
+        "A* 循环保护"
+        if trace.decision_source == "astar-loop-break"
+        else "A* 保护动作"
+        if trace.fallback_used
+        else "神经网络（防振荡）"
+        if trace.decision_source == "neural-anti-loop"
+        else "神经网络"
+    )
+    compact = width < 280
+    if compact:
+        _label(screen, f"步数 {trace.step:03d}", (x, area.y + 124), 18)
+        _label(screen, f"置信度 {trace.confidence:.1%}", (x, area.y + 146), 17)
+        source_y = area.y + 168
+        agreement_y = area.y + 189
+        inference_y = area.y + 210
+        candidate_y = area.y + 242
+        row_top = area.y + 268
+    else:
+        _label(screen, f"步数 {trace.step:03d}   置信度 {trace.confidence:.1%}", (x, area.y + 124), 19)
+        source_y = area.y + 148
+        agreement_y = area.y + 169
+        inference_y = area.y + 190
+        candidate_y = area.y + 222
+        row_top = area.y + 248
+    _label(screen, source, (x, source_y), 16, BAD_COLOR if trace.fallback_used else MUTED_COLOR)
+    _label(screen, f"折模型一致性 {trace.fold_agreement:.0%}", (x, agreement_y), 16, BAD_COLOR if trace.fallback_used else MUTED_COLOR)
+    _label(screen, f"推理耗时 {trace.inference_ms:.2f} 毫秒", (x, inference_y), 16, MUTED_COLOR)
+    _label(screen, "候选动作", (x, candidate_y), 18, MUTED_COLOR)
     max_q = max((candidate.q_value for candidate in trace.candidates if candidate.legal), default=1.0)
     min_q = min((candidate.q_value for candidate in trace.candidates if candidate.legal), default=0.0)
     q_span = max_q - min_q or 1.0
@@ -74,26 +175,37 @@ def draw_ai_panel(
             color = GOOD_COLOR if (candidate.heuristic_delta or 0) >= 0 else BAD_COLOR
         else:
             color = (150, 160, 172) if candidate.legal else (190, 195, 202)
-        _label(screen, candidate.action.name, (x, y + 3), 18, color)
-        _bar(screen, pygame.Rect(x + 76, y + 6, max(50, width - 168), 12), candidate.probability, color)
+        _label(screen, _action_label(candidate.action.name), (x, y + 3), 18, color)
+        delta_text = f"启发式{candidate.heuristic_delta:+d}" if candidate.heuristic_delta is not None else ""
+        q_text = f"{candidate.q_value:+.2f}" if candidate.legal else "非法"
+        value_font_size = 15 if width >= 280 else 13
+        q_font_size = 16 if width >= 280 else 14
+        right_edge = area.right - 18
+        q_width = _font(q_font_size).size(q_text)[0]
+        delta_width = _font(value_font_size).size(delta_text)[0]
+        q_x = right_edge - q_width
+        delta_x = q_x - 8 - delta_width
+        bar_x = x + (76 if width >= 280 else 40)
+        bar_width = max(1, delta_x - 10 - bar_x)
+        _bar(screen, pygame.Rect(bar_x, y + 6, bar_width, 12), candidate.probability, color)
         q_fraction = (candidate.q_value - min_q) / q_span if candidate.legal else 0.0
-        _bar(screen, pygame.Rect(x + 76, y + 22, max(50, width - 168), 5), q_fraction, GOOD_COLOR if candidate.legal else BAR_BACKGROUND)
-        q_text = f"{candidate.q_value:+.2f}" if candidate.legal else "illegal"
-        delta_text = f"d{candidate.heuristic_delta:+d}" if candidate.heuristic_delta is not None else ""
-        _label(screen, delta_text, (x + width - 104, y + 7), 15, color if candidate.legal else MUTED_COLOR)
-        _label(screen, q_text, (x + width - 56, y + 7), 16, TEXT_COLOR if candidate.legal else MUTED_COLOR)
+        _bar(screen, pygame.Rect(bar_x, y + 22, bar_width, 5), q_fraction, GOOD_COLOR if candidate.legal else BAR_BACKGROUND)
+        _label(screen, delta_text, (delta_x, y + 7), value_font_size, color if candidate.legal else MUTED_COLOR)
+        _label(screen, q_text, (q_x, y + 7), q_font_size, TEXT_COLOR if candidate.legal else MUTED_COLOR)
 
     hidden_top = row_top + 4 * 43 + 22
-    _label(screen, "HIDDEN ACTIVATION SUMMARY", (x, hidden_top), 17, MUTED_COLOR)
+    _label(screen, "隐藏层激活摘要", (x, hidden_top), 17, MUTED_COLOR)
     hidden = trace.hidden_summary or (0.0,)
     maximum = max(abs(value) for value in hidden) or 1.0
     for index, value in enumerate(hidden):
         bar_height = int(min(42, abs(value) / maximum * 42))
         bar = pygame.Rect(x + index * 24, hidden_top + 24 + (42 - bar_height), 15, bar_height)
         pygame.draw.rect(screen, ACCENT_COLOR if value >= 0 else BAD_COLOR, bar, border_radius=2)
-    _label(screen, "recent moves", (x, hidden_top + 82), 17, MUTED_COLOR)
+    _label(screen, "最近动作", (x, hidden_top + 82), 17, MUTED_COLOR)
     for index, action in enumerate(recent_actions[-5:]):
-        _label(screen, action, (x, hidden_top + 105 + index * 20), 16, TEXT_COLOR)
+        _label(screen, _action_label(action), (x, hidden_top + 105 + index * 20), 16, TEXT_COLOR)
+    draw_options()
+    return selector_rect, tuple(option_rects)
 
 
 def draw_action_overlay(
