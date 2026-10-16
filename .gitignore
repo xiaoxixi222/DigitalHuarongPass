@@ -53,10 +53,6 @@ records/
 dashboard/node_modules/
 src/game_chat_room/server/static/
 
-# Generated artifacts
-models/*.pt
-models/*.pth
-data/neural-solver/
 
 # Local planning and working notes
 .workbuddy/

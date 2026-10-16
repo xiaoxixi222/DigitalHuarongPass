@@ -6,10 +6,12 @@ import json
 import random
 import shutil
 import subprocess
+import sys
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Iterable
 
 import torch
@@ -20,15 +22,61 @@ from .agent import (
     AStarGuardedAgent,
     DecisionAgent,
     DecisionTrace,
+    EighthGenerationNeuralAgent,
     EnsembleNeuralAgent,
     NeuralBeamAgent,
     NeuralAgent,
     load_agent,
 )
-from .dataset import Example, generate_examples, generate_trajectory_examples
-from .encoding import Action, PuzzleState, encode_state, goal_state, legal_actions
+from .dataset import (
+    Example,
+    augment_example,
+    collect_dagger_examples,
+    generate_examples,
+    generate_uniform_examples,
+    generate_uniform_trajectory_examples,
+    generate_trajectory_examples,
+)
+from .encoding import (
+    ENHANCED_FEATURE_SIZE,
+    Action,
+    PuzzleState,
+    encode_state,
+    encode_state_enhanced,
+    goal_state,
+    legal_actions,
+)
 from .environment import PuzzleEnvironment
-from .model import HuarongNet, load_checkpoint, save_checkpoint
+from .model import (
+    HuarongNet,
+    load_checkpoint,
+    save_checkpoint,
+    save_ensemble_checkpoint,
+)
+
+
+class _TrainingProgress:
+    """Dependency-free terminal progress bar for long CPU runs."""
+
+    def __init__(self, *, total: int = 100):
+        self.total = total
+        self.current = 0
+        self.started = perf_counter()
+
+    def update(self, current: int, label: str) -> None:
+        self.current = max(0, min(self.total, int(current)))
+        width = 32
+        filled = int(width * self.current / self.total)
+        elapsed = perf_counter() - self.started
+        eta_text = ""
+        if self.current:
+            eta = elapsed * (self.total - self.current) / self.current
+            eta_text = f" ETA {eta / 60:.1f}m"
+        line = f"\r训练进度 [{'#' * filled}{'-' * (width - filled)}] {self.current:3d}% {label}{eta_text}"
+        sys.stderr.write(line[:180].ljust(180))
+        sys.stderr.flush()
+        if self.current >= self.total:
+            sys.stderr.write("\n")
 
 
 @dataclass(frozen=True)
@@ -209,6 +257,220 @@ def train_cross_validation(
     return models, fold_metrics, histories
 
 
+def _eighth_loader(
+    examples: tuple[Example, ...],
+    batch_size: int,
+    shuffle: bool,
+    *,
+    enhanced: bool = False,
+) -> DataLoader:
+    if not examples:
+        raise ValueError("eighth-generation training requires at least one example")
+    encoder = encode_state_enhanced if enhanced else lambda state: encode_state(state, include_heuristic=False)
+    features = torch.stack([encoder(example.state) for example in examples])
+    successor_features = torch.stack(
+        [
+            encoder(example.next_state or example.state)
+            for example in examples
+        ]
+    )
+    actions = torch.tensor([int(example.expert_action) for example in examples])
+    remaining = torch.tensor([float(example.remaining_steps) for example in examples])
+    successor_remaining = torch.clamp(remaining - 1.0, min=0.0)
+    buckets = torch.tensor(
+        [min(96, example.distance_bucket or example.remaining_steps) for example in examples]
+    )
+    legal_masks = torch.zeros((len(examples), len(Action)), dtype=torch.bool)
+    risk_targets = torch.ones((len(examples), len(Action)), dtype=torch.float32)
+    for index, example in enumerate(examples):
+        for action in legal_actions(example.state):
+            legal_masks[index, int(action)] = True
+        risk_targets[index, int(example.expert_action)] = 0.0
+    return DataLoader(
+        TensorDataset(
+            features,
+            successor_features,
+            actions,
+            remaining,
+            successor_remaining,
+            buckets,
+            legal_masks,
+            risk_targets,
+        ),
+        batch_size=min(batch_size, len(examples)),
+        shuffle=shuffle,
+    )
+
+
+def _ranking_loss(
+    q_values: torch.Tensor,
+    actions: torch.Tensor,
+    legal_masks: torch.Tensor,
+) -> torch.Tensor:
+    selected = q_values.gather(1, actions.unsqueeze(1))
+    losses: list[torch.Tensor] = []
+    for index in range(len(actions)):
+        alternatives = legal_masks[index].clone()
+        alternatives[int(actions[index])] = False
+        if alternatives.any():
+            losses.append(
+                torch.relu(0.25 - selected[index, 0] + q_values[index][alternatives]).mean()
+            )
+    if not losses:
+        return q_values.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def train_eighth_generation_fold(
+    train_examples: tuple[Example, ...],
+    validation_examples: tuple[Example, ...],
+    *,
+    epochs: int,
+    batch_size: int = 128,
+    learning_rate: float = 2e-3,
+    device: str = "cpu",
+    input_size: int = 260,
+    enhanced: bool = False,
+    progress: _TrainingProgress | None = None,
+    progress_start: int = 0,
+    progress_end: int = 0,
+) -> tuple[HuarongNet, list[dict[str, float]], HuarongNet]:
+    model = HuarongNet(input_size=input_size).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    train_loader = _eighth_loader(
+        train_examples, batch_size, shuffle=True, enhanced=enhanced
+    )
+    validation_loader = _eighth_loader(
+        validation_examples, batch_size, shuffle=False, enhanced=enhanced
+    )
+    history: list[dict[str, float]] = []
+    best_score = float("-inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    final_state: dict[str, torch.Tensor] | None = None
+    for epoch in range(1, epochs + 1):
+        if progress is not None and progress_end > progress_start:
+            progress.update(
+                progress_start + (progress_end - progress_start) * (epoch - 1) // epochs,
+                f"fold training epoch {epoch}/{epochs}",
+            )
+        model.train()
+        train_total = 0.0
+        for (
+            features,
+            successor_features,
+            actions,
+            remaining,
+            successor_remaining,
+            buckets,
+            legal_masks,
+            risk_targets,
+        ) in train_loader:
+            features = features.to(device)
+            actions = actions.to(device)
+            remaining = remaining.to(device)
+            successor_features = successor_features.to(device)
+            successor_remaining = successor_remaining.to(device)
+            buckets = buckets.to(device)
+            legal_masks = legal_masks.to(device)
+            risk_targets = risk_targets.to(device)
+            outputs = model.forward_full(features)
+            successor_outputs = model.forward_full(successor_features)
+            masked_policy = outputs["policy_logits"].masked_fill(~legal_masks, -1e9)
+            selected_q = outputs["q_values"].gather(1, actions.unsqueeze(1)).squeeze(1)
+            loss = (
+                nn.functional.cross_entropy(masked_policy, actions)
+                + 0.35 * nn.functional.smooth_l1_loss(outputs["distance"].squeeze(1), remaining)
+                + 0.20 * nn.functional.cross_entropy(outputs["distance_logits"], buckets)
+                + 0.20 * _ranking_loss(outputs["q_values"], actions, legal_masks)
+                + 0.20 * nn.functional.binary_cross_entropy_with_logits(
+                    outputs["risk_logits"], risk_targets
+                )
+                + 0.10 * nn.functional.smooth_l1_loss(selected_q, -remaining)
+                + 0.20
+                * nn.functional.smooth_l1_loss(
+                    successor_outputs["distance"].squeeze(1), successor_remaining
+                )
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_total += float(loss.item()) * len(features)
+
+        model.eval()
+        validation_total = 0.0
+        correct = 0
+        distance_correct = 0
+        count = 0
+        with torch.inference_mode():
+            for (
+                features,
+                successor_features,
+                actions,
+                remaining,
+                successor_remaining,
+                buckets,
+                legal_masks,
+                risk_targets,
+            ) in validation_loader:
+                features = features.to(device)
+                actions = actions.to(device)
+                remaining = remaining.to(device)
+                successor_features = successor_features.to(device)
+                successor_remaining = successor_remaining.to(device)
+                buckets = buckets.to(device)
+                legal_masks = legal_masks.to(device)
+                risk_targets = risk_targets.to(device)
+                outputs = model.forward_full(features)
+                successor_outputs = model.forward_full(successor_features)
+                masked_policy = outputs["policy_logits"].masked_fill(~legal_masks, -1e9)
+                selected_q = outputs["q_values"].gather(1, actions.unsqueeze(1)).squeeze(1)
+                validation_loss = (
+                    nn.functional.cross_entropy(masked_policy, actions)
+                    + 0.35 * nn.functional.smooth_l1_loss(outputs["distance"].squeeze(1), remaining)
+                    + 0.20 * nn.functional.cross_entropy(outputs["distance_logits"], buckets)
+                    + 0.20 * _ranking_loss(outputs["q_values"], actions, legal_masks)
+                    + 0.20 * nn.functional.binary_cross_entropy_with_logits(
+                        outputs["risk_logits"], risk_targets
+                    )
+                    + 0.10 * nn.functional.smooth_l1_loss(selected_q, -remaining)
+                    + 0.20
+                    * nn.functional.smooth_l1_loss(
+                        successor_outputs["distance"].squeeze(1), successor_remaining
+                    )
+                )
+                validation_total += float(validation_loss.item()) * len(features)
+                correct += int((masked_policy.argmax(dim=1) == actions).sum().item())
+                distance_correct += int(
+                    (outputs["distance_logits"].argmax(dim=1) == buckets).sum().item()
+                )
+                count += len(features)
+        validation_accuracy = correct / max(1, count)
+        distance_accuracy = distance_correct / max(1, count)
+        final_state = copy.deepcopy(model.state_dict())
+        score = 0.75 * validation_accuracy + 0.25 * distance_accuracy
+        history.append(
+            {
+                "epoch": float(epoch),
+                "train_loss": train_total / max(1, len(train_examples)),
+                "validation_loss": validation_total / max(1, len(validation_examples)),
+                "validation_accuracy": validation_accuracy,
+                "distance_accuracy": distance_accuracy,
+                "score": score,
+            }
+        )
+        if score > best_score:
+            best_score = score
+            best_state = copy.deepcopy(model.state_dict())
+    if progress is not None and progress_end > progress_start:
+        progress.update(progress_end, "fold training complete")
+    best_model = HuarongNet(input_size=input_size)
+    best_model.load_state_dict(best_state or model.state_dict())
+    final_model = HuarongNet(input_size=input_size)
+    final_model.load_state_dict(final_state or model.state_dict())
+    return best_model, history, final_model
+
+
 def _trace_to_dict(trace: DecisionTrace) -> dict[str, Any]:
     return {
         "state": list(trace.state),
@@ -221,6 +483,10 @@ def _trace_to_dict(trace: DecisionTrace) -> dict[str, Any]:
         "fold_agreement": trace.fold_agreement,
         "fallback_used": trace.fallback_used,
         "decision_source": trace.decision_source,
+        "predicted_distance": trace.predicted_distance,
+        "risk": trace.risk,
+        "beam_failure": trace.beam_failure,
+        "loop_detected": trace.loop_detected,
         "candidates": [
             {
                 "action": candidate.action.name,
@@ -241,6 +507,7 @@ def evaluate_decider(
     *,
     max_steps: int = 120,
     device: str = "cpu",
+    move_time_ms: float = 300.0,
 ) -> tuple[dict[str, Any], list[DecisionTrace]]:
     solved = 0
     illegal = 0
@@ -251,14 +518,25 @@ def evaluate_decider(
     agreement_values: list[float] = []
     steps_taken: list[int] = []
     inference_times: list[float] = []
+    wall_times: list[float] = []
+    repeated_state_visits = 0
+    beam_failures = 0
+    solved_30s = 0
     traces: list[DecisionTrace] = []
     for example in examples:
+        episode_started = perf_counter()
+        executed_steps = 0
         reset = getattr(agent, "reset", None)
         if callable(reset):
             reset()
         environment = PuzzleEnvironment(example.state, max_steps=max_steps)
+        seen_states: set[PuzzleState] = set()
         for step in range(max_steps):
+            if environment.state in seen_states:
+                repeated_state_visits += 1
+            seen_states.add(environment.state)
             trace = agent.decide(environment.state, step=step)
+            executed_steps = step + 1
             decisions += 1
             if step == 0 and trace.selected_action == example.expert_action:
                 first_action_matches += 1
@@ -266,6 +544,7 @@ def evaluate_decider(
                 traces.append(trace)
             inference_times.append(trace.inference_ms)
             fallback_decisions += int(trace.fallback_used)
+            beam_failures += int(trace.beam_failure)
             agreement_values.append(trace.fold_agreement)
             transition = environment.step(trace.selected_action)
             if not transition.legal:
@@ -277,6 +556,10 @@ def evaluate_decider(
                     solved += 1
                     steps_taken.append(step + 1)
                 break
+        wall_time_ms = (perf_counter() - episode_started) * 1000.0 + executed_steps * move_time_ms
+        wall_times.append(wall_time_ms)
+        if environment.state == goal_state() and wall_time_ms <= 30_000.0:
+            solved_30s += 1
     count = len(examples)
     return (
         {
@@ -292,9 +575,16 @@ def evaluate_decider(
             if inference_times
             else 0.0,
             "fallback_rate": fallback_decisions / max(1, decisions),
+            "beam_failure_rate": beam_failures / max(1, decisions),
+            "repeated_state_visits": repeated_state_visits,
             "average_fold_agreement": sum(agreement_values) / len(agreement_values)
             if agreement_values
             else 1.0,
+            "solve_rate_30s": solved_30s / count if count else 0.0,
+            "average_wall_time_ms": sum(wall_times) / len(wall_times) if wall_times else 0.0,
+            "p95_wall_time_ms": sorted(wall_times)[max(0, int(len(wall_times) * 0.95) - 1)]
+            if wall_times
+            else 0.0,
             "astar_average_steps": sum(example.remaining_steps for example in examples) / count
             if count
             else None,
@@ -517,6 +807,22 @@ def train_dqn(
     return history
 
 
+def evaluate_uniform_random(
+    agent: DecisionAgent,
+    *,
+    games: int,
+    seed: int,
+    max_steps: int = 100,
+    device: str = "cpu",
+) -> dict[str, Any]:
+    """Evaluate on the same uniform solvable distribution used by the game reset."""
+    examples = generate_uniform_examples(games, seed=seed)
+    evaluation, _ = evaluate_decider(
+        agent, examples, max_steps=max_steps, device=device
+    )
+    return evaluation
+
+
 def write_training_report(
     metrics: dict[str, Any],
     traces: list[DecisionTrace],
@@ -651,6 +957,26 @@ def write_training_report(
             )
         depth_lines.extend([""])
         lines[insert_at:insert_at] = depth_lines
+    uniform_evaluation = metrics.get("uniform_random_evaluation")
+    if uniform_evaluation:
+        insert_at = lines.index("## Training History")
+        uniform_lines = [
+            "## Uniform Random Board Evaluation",
+            "",
+            "This evaluation uses uniformly shuffled solvable boards, matching the interactive random reset distribution.",
+            "",
+            "| Metric | Value |",
+            "| --- | ---: |",
+            f"| Games | {uniform_evaluation.get('games', 0)} |",
+            f"| Solved | {uniform_evaluation.get('solved', 0)} |",
+            f"| Solve rate | {uniform_evaluation.get('solve_rate', 0):.2%} |",
+            f"| Solve rate within 30 seconds | {uniform_evaluation.get('solve_rate_30s', 0):.2%} |",
+            f"| Illegal action rate | {uniform_evaluation.get('illegal_action_rate', 0):.2%} |",
+            f"| Beam failure rate | {uniform_evaluation.get('beam_failure_rate', 0):.2%} |",
+            f"| Repeated state visits | {uniform_evaluation.get('repeated_state_visits', 0)} |",
+            "",
+        ]
+        lines[insert_at:insert_at] = uniform_lines
     for index, trace in enumerate(traces, start=1):
         lines.extend(
             [
@@ -684,8 +1010,14 @@ def run_training(
     seed: int = 42,
     output_root: Path = Path("."),
     device: str = "cpu",
+    video_output: Path | None = None,
+    video_games: int = 4,
+    dagger_episodes: int = 0,
 ) -> TrainingResult:
     _set_seed(seed)
+    progress = _TrainingProgress() if stage == "eighth-generation" else None
+    if progress is not None:
+        progress.update(1, "initializing")
     output_root = Path(output_root)
     model_dir = output_root / "models"
     report_dir = output_root / "reports"
@@ -707,8 +1039,14 @@ def run_training(
             "episodes": episodes,
             "eval_games": eval_games,
             "folds": folds,
-            "train_max_depth": train_max_depth if stage == "sixth-generation" else None,
+            "train_max_depth": (
+                train_max_depth
+                if stage in ("sixth-generation", "eighth-generation")
+                else None
+            ),
             "board": "4x4",
+            "video_games": video_games,
+            "dagger_episodes": dagger_episodes,
         },
     }
 
@@ -932,6 +1270,171 @@ def run_training(
             "Selected a pure neural ensemble combining frozen fifth-generation folds with five new folds "
             "trained on deeper offline teacher trajectories; the checkpoint explicitly disables the A* runtime guard."
         )
+    elif stage == "eighth-generation":
+        if train_max_depth < 2:
+            raise ValueError("train_max_depth must be at least 2")
+        trajectory_count = max(1, samples // 3)
+        raw_examples = generate_trajectory_examples(
+            trajectory_count,
+            seed=seed,
+            min_depth=2,
+            max_depth=train_max_depth,
+        )
+        if progress is not None:
+            progress.update(8, "trajectory labels ready")
+        uniform_examples = generate_uniform_trajectory_examples(
+            samples - len(raw_examples), seed=seed + 5000
+        )
+        if progress is not None:
+            progress.update(12, "uniform random trajectory labels ready")
+        combined_training: dict[PuzzleState, Example] = {
+            example.state: example for example in raw_examples
+        }
+        combined_training.update({example.state: example for example in uniform_examples})
+        raw_examples = tuple(combined_training.values())
+
+        def train_folds(
+            fold_examples: tuple[Example, ...],
+            fold_epochs: int,
+            *,
+            progress_start: int = 12,
+            progress_end: int = 70,
+        ) -> tuple[list[HuarongNet], list[dict[str, Any]], list[list[dict[str, float]]]]:
+            trained_models: list[HuarongNet] = []
+            trained_metrics: list[dict[str, Any]] = []
+            trained_histories: list[list[dict[str, float]]] = []
+            for fold_index, (fold_train, fold_validation) in enumerate(
+                _kfold_examples(fold_examples, folds=folds, seed=seed), start=1
+            ):
+                augmented_train = tuple(
+                    augmented
+                    for example in fold_train
+                    for augmented in augment_example(example)
+                )
+                _set_seed(seed + fold_index)
+                best_model, fold_history, final_model = train_eighth_generation_fold(
+                    augmented_train,
+                    fold_validation,
+                    epochs=fold_epochs,
+                    input_size=ENHANCED_FEATURE_SIZE,
+                    enhanced=True,
+                    device=device,
+                    progress=progress,
+                    progress_start=progress_start
+                    + int((progress_end - progress_start) * (fold_index - 1) / folds),
+                    progress_end=progress_start
+                    + int((progress_end - progress_start) * fold_index / folds),
+                )
+                best_eval, _ = evaluate_agent(best_model, fold_validation, device=device)
+                final_eval, _ = evaluate_agent(final_model, fold_validation, device=device)
+                selected = best_model
+                selected_eval = best_eval
+                if final_eval["solve_rate"] > best_eval["solve_rate"] or (
+                    final_eval["solve_rate"] == best_eval["solve_rate"]
+                    and (final_eval["average_steps"] or float("inf"))
+                    < (best_eval["average_steps"] or float("inf"))
+                ):
+                    selected = final_model
+                    selected_eval = final_eval
+                trained_models.append(selected)
+                trained_histories.append(fold_history)
+                trained_metrics.append(
+                    {
+                        "fold": fold_index,
+                        "train": len(fold_train),
+                        "augmented_train": len(augmented_train),
+                        "validation": len(fold_validation),
+                        "validation_evaluation": best_eval,
+                        "final_evaluation": final_eval,
+                        "selected_evaluation": selected_eval,
+                    }
+                )
+            return trained_models, trained_metrics, trained_histories
+
+        models, fold_metrics, histories = train_folds(raw_examples, epochs)
+        initial_agent = EighthGenerationNeuralAgent(models, device=device)
+        dagger_examples: tuple[Example, ...] = ()
+        if dagger_episodes > 0:
+            if progress is not None:
+                progress.update(72, "collecting hard-board DAgger states")
+            dagger_examples = collect_dagger_examples(
+                initial_agent,
+                uniform_examples[: max(1, min(dagger_episodes, len(uniform_examples)))],
+                max_steps=96,
+                seed=seed + 7000,
+            )
+            combined: dict[PuzzleState, Example] = {example.state: example for example in raw_examples}
+            combined.update({example.state: example for example in dagger_examples})
+            models, fold_metrics, histories = train_folds(
+                tuple(combined.values()),
+                max(1, epochs // 2),
+                progress_start=72,
+                progress_end=88,
+            )
+        if progress is not None:
+            progress.update(88, "cross-validation and DAgger complete")
+        checkpoint_path = model_dir / "第八代数字华容道高速王.pt"
+        save_ensemble_checkpoint(
+            checkpoint_path,
+            models,
+            {
+                "stage": "eighth-generation",
+                "model_name": "第八代数字华容道高速王",
+                "display_name": "第八代数字华容道高速王",
+                "seed": seed,
+                "folds": folds,
+                "train_min_depth": 2,
+                "train_max_depth": train_max_depth,
+                "offline_teacher": "weighted A*",
+                "astar_guard": False,
+                "neural_planner": "pure-neural-beam",
+                "state_representation": "enhanced-v3",
+                "successor_value_training": True,
+                "beam_width": 32,
+                "beam_horizon": 96,
+                "dagger_examples": len(dagger_examples),
+            },
+        )
+        agent = EighthGenerationNeuralAgent(
+            models,
+            device=device,
+            beam_width=32,
+            horizon=96,
+        )
+        metrics["dataset"] = {
+            "requested": samples,
+            "train": len(raw_examples),
+            "validation": len(raw_examples) // folds,
+            "label_failures": 0,
+            "min_depth": 2,
+            "max_depth": train_max_depth,
+            "trajectory_examples": len(raw_examples) - len(uniform_examples),
+            "uniform_random_examples": len(uniform_examples),
+            "dagger_examples": len(dagger_examples),
+        }
+        metrics["cross_validation"] = {"folds": fold_metrics, "histories": histories}
+        metrics["depth_buckets"] = evaluate_depth_buckets(
+            agent,
+            games_per_bucket=max(1, min(eval_games, 2)),
+            seed=seed + 1000,
+            depths=(12, 16, 20, 24),
+            max_steps=100,
+            device=device,
+        )
+        metrics["uniform_random_evaluation"] = evaluate_uniform_random(
+            agent,
+            games=eval_games,
+            seed=seed + 5000,
+            max_steps=100,
+            device=device,
+        )
+        if progress is not None:
+            progress.update(96, "uniform random evaluation complete")
+        history = [row for fold_history in histories for row in fold_history]
+        metrics["selection_reason"] = (
+            "Five state-disjoint multi-task fold models were embedded into one checkpoint; "
+            "runtime uses the pure neural beam without A* or heuristic scoring."
+        )
     elif stage == "eval-only":
         if checkpoint is None:
             raise ValueError("--checkpoint is required for eval-only stage")
@@ -984,6 +1487,50 @@ def run_training(
             shutil.copyfile(checkpoint, selected_path)
             metrics["selection_reason"] = "Supervised checkpoint retained because DQN did not improve evaluation."
     metrics["selected_checkpoint"] = str(selected_path)
+    if stage == "eighth-generation":
+        from .training_video import (
+            encode_training_video,
+            render_comparison_frames,
+            render_training_metrics,
+        )
+
+        metrics_png = report_dir / "第八代数字华容道高速王-训练指标.png"
+        render_training_metrics(metrics, metrics_png)
+        video_path = Path(video_output) if video_output is not None else report_dir / "第八代数字华容道高速王-训练过程.mp4"
+        if video_output is not None and not video_path.is_absolute():
+            video_path = output_root / video_path
+        frame_dir = report_dir / f".第八代数字华容道高速王-frames-{timestamp}"
+        early_agent = EighthGenerationNeuralAgent(
+            [HuarongNet()], device=device, beam_width=8, horizon=24
+        )
+        video_examples = generate_examples(
+            max(1, video_games),
+            seed=seed + 3000,
+            min_depth=16,
+            max_depth=24,
+        )
+        video_states = [example.state for example in video_examples]
+        frame_count = render_comparison_frames(
+            early_agent,
+            agent,
+            video_states,
+            frame_dir,
+            fps=5,
+            max_steps=32,
+        )
+        encoded = encode_training_video(frame_dir, video_path, fps=5)
+        metrics["video"] = {
+            "output": str(video_path),
+            "frames": frame_count,
+            "encoded": encoded,
+            "metrics_png": str(metrics_png),
+            "early_checkpoint": "untrained HuarongNet",
+            "final_checkpoint": str(selected_path),
+        }
+        if encoded:
+            shutil.rmtree(frame_dir, ignore_errors=True)
+        if progress is not None:
+            progress.update(100, "video and artifacts written")
     write_training_report(metrics, traces, report_path, metrics_path)
     return TrainingResult(selected_path, report_path, metrics_path)
 
@@ -998,6 +1545,7 @@ def main() -> None:
             "cross-validation",
             "crossval",
             "sixth-generation",
+            "eighth-generation",
             "eval-only",
         ),
         default="imitation",
@@ -1017,6 +1565,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-root", type=Path, default=Path("."))
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--video-output", type=Path)
+    parser.add_argument("--video-games", type=int, default=4)
+    parser.add_argument("--dagger-episodes", type=int, default=0)
     args = parser.parse_args()
     result = run_training(**vars(args))
     print(f"checkpoint: {result.checkpoint}")

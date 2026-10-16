@@ -52,3 +52,14 @@ uv run python -m render.window --model models/第七代飞天数字华容道享�
 The fifth-generation `models/第五代超级数字华容道之神.pt` checkpoint remains available for comparison. It may contain A* guard metadata, but the game loader now disables the guard for interactive inference as well.
 
 Press `A` to toggle AI mode, `Space` to pause or advance one move while paused, `T` to show or hide the decision panel, `R` to generate a new board, and `Esc` to reset to the solved board. The latest report is written under `reports/` and includes training metrics, evaluation results, and representative decision traces.
+
+## Eighth-generation high-speed king
+
+The eighth-generation trainer uses state-disjoint cross-validation folds, multi-task policy/distance/risk supervision, and a pure-neural beam planner at runtime. A* is used only to create offline teacher labels. The final artifact embeds every fold in one self-contained file, so sharing this one file is sufficient:
+
+```bash
+uv run python -m ai.train --stage eighth-generation --samples 3000 --epochs 20 --folds 5 --train-max-depth 1000 --eval-games 100 --video-output reports/第八代数字华容道高速王-训练过程.mp4 --seed 20261011
+uv run python -m render.window --model models/第八代数字华容道高速王.pt
+```
+
+Training also writes `reports/第八代数字华容道高速王-训练指标.png` and a fixed-board early-versus-final MP4. The video shows board states, selected actions, confidence, predicted remaining distance, and training metrics. If ffmpeg is unavailable, the checkpoint and metrics are still written and the raw frames are retained.

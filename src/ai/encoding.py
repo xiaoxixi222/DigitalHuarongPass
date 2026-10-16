@@ -7,6 +7,7 @@ import torch
 
 BOARD_SIDE = 4
 BOARD_SIZE = BOARD_SIDE * BOARD_SIDE
+ENHANCED_FEATURE_SIZE = 459
 PuzzleState: TypeAlias = tuple[int, ...]
 
 
@@ -114,8 +115,12 @@ def heuristic_score(state: PuzzleState) -> int:
     return distance + 2 * conflicts
 
 
-def encode_state(state: PuzzleState) -> torch.Tensor:
-    """Encode a state into a fixed 260-value float tensor."""
+def encode_state(state: PuzzleState, *, include_heuristic: bool = True) -> torch.Tensor:
+    """Encode a state into a fixed 260-value float tensor.
+
+    The eighth-generation runtime passes ``include_heuristic=False`` so its
+    neural policy does not consult the handcrafted heuristic during inference.
+    """
     validate_state(state)
     values: list[float] = []
     for tile in state:
@@ -123,15 +128,18 @@ def encode_state(state: PuzzleState) -> torch.Tensor:
         values.extend(1.0 if position == index else 0.0 for position in range(BOARD_SIZE))
 
     blank_row, blank_col = blank_position(state)
-    manhattan = sum(
-        abs(row - divmod(value - 1, BOARD_SIDE)[0])
-        + abs(col - divmod(value - 1, BOARD_SIDE)[1])
-        for row in range(BOARD_SIDE)
-        for col in range(BOARD_SIDE)
-        for value in (state[row * BOARD_SIDE + col],)
-        if value != -1
-    )
-    conflicts = max(0, heuristic_score(state) - manhattan)
+    manhattan = 0.0
+    conflicts = 0.0
+    if include_heuristic:
+        manhattan = sum(
+            abs(row - divmod(value - 1, BOARD_SIDE)[0])
+            + abs(col - divmod(value - 1, BOARD_SIDE)[1])
+            for row in range(BOARD_SIDE)
+            for col in range(BOARD_SIDE)
+            for value in (state[row * BOARD_SIDE + col],)
+            if value != -1
+        )
+        conflicts = max(0, heuristic_score(state) - int(manhattan))
     values.extend(
         (
             blank_row / (BOARD_SIDE - 1),
@@ -141,3 +149,46 @@ def encode_state(state: PuzzleState) -> torch.Tensor:
         )
     )
     return torch.tensor(values, dtype=torch.float32)
+
+
+def encode_state_enhanced(state: PuzzleState) -> torch.Tensor:
+    """Encode the permutation with features that expose tile geometry.
+
+    The original one-hot representation is lossless, but a small MLP has to
+    rediscover that every tile has a fixed goal coordinate.  This representation
+    keeps the original 260 values and appends per-tile coordinates, signed
+    displacement, goal-row/column indicators, and the four tiles adjacent to
+    the blank.  It contains no search or handcrafted heuristic score, so it is
+    safe for the pure-neural runtime.
+    """
+    validate_state(state)
+    base = encode_state(state, include_heuristic=False).tolist()
+    features: list[float] = list(base)
+    blank_index = state.index(-1)
+    blank_row, blank_col = divmod(blank_index, BOARD_SIDE)
+    for tile in range(1, BOARD_SIZE):
+        position = state.index(tile)
+        row, col = divmod(position, BOARD_SIDE)
+        goal_row, goal_col = divmod(tile - 1, BOARD_SIDE)
+        features.extend(
+            (
+                row / 3.0,
+                col / 3.0,
+                goal_row / 3.0,
+                goal_col / 3.0,
+                (row - goal_row) / 3.0,
+                (col - goal_col) / 3.0,
+                (abs(row - goal_row) + abs(col - goal_col)) / 6.0,
+                float(row == goal_row),
+                float(col == goal_col),
+            )
+        )
+    for delta_row, delta_col in ACTION_DELTAS.values():
+        row = blank_row + delta_row
+        col = blank_col + delta_col
+        value = state[row * BOARD_SIDE + col] if 0 <= row < 4 and 0 <= col < 4 else -1
+        features.extend(float(value == candidate) for candidate in (-1, *range(1, BOARD_SIZE)))
+    encoded = torch.tensor(features, dtype=torch.float32)
+    if encoded.numel() != ENHANCED_FEATURE_SIZE:
+        raise AssertionError(f"enhanced encoding has {encoded.numel()} features")
+    return encoded

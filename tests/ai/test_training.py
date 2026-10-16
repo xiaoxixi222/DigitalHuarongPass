@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 
 from ai.dataset import generate_examples
+from ai.model import load_ensemble_checkpoint
 from ai.train import _double_dqn_targets, _kfold_examples, run_training
 
 
@@ -54,3 +55,26 @@ def test_dqn_target_masks_illegal_actions_and_uses_double_dqn_selection():
     )
 
     assert torch.equal(targets, torch.tensor([6.0]))
+
+
+def test_eighth_generation_writes_one_embedded_checkpoint(tmp_path: Path):
+    result = run_training(
+        stage="eighth-generation",
+        samples=8,
+        epochs=1,
+        folds=2,
+        eval_games=1,
+        train_max_depth=8,
+        video_games=1,
+        output_root=tmp_path,
+        seed=13,
+    )
+
+    assert result.checkpoint.name == "第八代数字华容道高速王.pt"
+    models, metadata = load_ensemble_checkpoint(result.checkpoint)
+    assert len(models) == 2
+    assert metadata["model_name"] == "第八代数字华容道高速王"
+    assert result.metrics.exists()
+
+    metrics = __import__("json").loads(result.metrics.read_text())
+    assert metrics["uniform_random_evaluation"]["games"] == 1

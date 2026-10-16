@@ -7,10 +7,11 @@ from ai.agent import (
     EnsembleNeuralAgent,
     NeuralAgent,
     NeuralBeamAgent,
+    EighthGenerationNeuralAgent,
     load_agent,
 )
 from ai.encoding import Action, apply_action, goal_state, legal_actions
-from ai.model import HuarongNet, save_checkpoint
+from ai.model import HuarongNet, save_checkpoint, save_ensemble_checkpoint
 
 
 class _AlternatingModel:
@@ -32,6 +33,32 @@ class _AlternatingModel:
 
     def hidden(self, features):
         return torch.zeros((features.shape[0], 64))
+
+
+class _AlternatingFullModel:
+    """Force the v8 fallback path to propose RIGHT, LEFT, RIGHT."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def to(self, device):
+        return self
+
+    def eval(self):
+        return self
+
+    def forward_full(self, features):
+        logits = torch.full((features.shape[0], 4), -10.0)
+        action = Action.RIGHT if self.calls % 2 == 0 else Action.LEFT
+        logits[:, int(action)] = 10.0
+        self.calls += 1
+        return {
+            "policy_logits": logits,
+            "q_values": torch.zeros((features.shape[0], 4)),
+            "distance": torch.ones((features.shape[0], 1)),
+            "distance_logits": torch.zeros((features.shape[0], 97)),
+            "risk_logits": torch.zeros((features.shape[0], 4)),
+        }
 
 
 def test_agent_never_selects_illegal_action():
@@ -171,6 +198,51 @@ def test_neural_beam_agent_reset_discards_cached_plan():
     agent.reset()
     agent.decide(state)
     assert plan_calls == 2
+
+
+def test_eighth_generation_embedded_agent_never_calls_astar(monkeypatch, tmp_path):
+    path = tmp_path / "第八代数字华容道高速王.pt"
+    save_ensemble_checkpoint(
+        path,
+        [HuarongNet(), HuarongNet()],
+        {
+            "stage": "eighth-generation",
+            "model_name": "第八代数字华容道高速王",
+            "beam_width": 4,
+            "beam_horizon": 4,
+        },
+    )
+    monkeypatch.setattr("ai.agent.astar_action", lambda state: (_ for _ in ()).throw(AssertionError("A* must not run")))
+    monkeypatch.setattr("ai.agent.heuristic_score", lambda state: (_ for _ in ()).throw(AssertionError("heuristic must not run")))
+    monkeypatch.setattr("ai.encoding.heuristic_score", lambda state: (_ for _ in ()).throw(AssertionError("heuristic must not run")))
+    monkeypatch.setattr("ai.agent.Board.get_road", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("A* must not run")))
+
+    agent, metadata = load_agent(path, use_guard=False)
+    state = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, -1, 15)
+    trace = agent.decide(state)
+
+    assert metadata["model_name"] == "第八代数字华容道高速王"
+    assert isinstance(agent, EighthGenerationNeuralAgent)
+    assert trace.selected_action == Action.RIGHT
+    assert trace.decision_source == "eighth-generation-neural-beam"
+
+
+def test_eighth_generation_fallback_breaks_repeated_two_state_oscillation():
+    state = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, -1, 15)
+    agent = EighthGenerationNeuralAgent(
+        [_AlternatingFullModel()], beam_width=1, horizon=1
+    )
+    # Keep the test focused on the single-step fallback after a failed beam.
+    agent._plan = lambda start: None
+
+    first = agent.decide(state)
+    assert first.selected_action == Action.RIGHT
+    next_state = apply_action(state, first.selected_action)
+    assert next_state is not None
+    second = agent.decide(next_state)
+    assert second.selected_action != Action.LEFT
+    assert second.selected_action in legal_actions(next_state)
+    assert second.loop_detected is True
 
 
 def test_astar_agent_solves_one_move_state_in_a_single_step():

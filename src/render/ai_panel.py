@@ -25,6 +25,8 @@ ACTION_LABELS = {
     "RIGHT": "右",
 }
 MODEL_LABELS = {
+    "eighth-generation": "第八代数字华容道高速王",
+    "第八代数字华容道高速王": "第八代数字华容道高速王",
     "sixth-generation": "第六代无拐杖数字华容道之神",
     "第七代飞天数字华容道享受者.pt": "第七代飞天数字华容道享受者",
     "sixth-generation-fold": "第六代深度折模型",
@@ -137,7 +139,9 @@ def draw_ai_panel(
         return selector_rect, tuple(option_rects)
 
     source = (
-        "A* 加权搜索 (w=2.0)"
+        "第八代纯神经 beam"
+        if trace.decision_source == "eighth-generation-neural-beam"
+        else "A* 加权搜索 (w=2.0)"
         if trace.decision_source == "astar"
         else "A* 循环保护"
         if trace.decision_source == "astar-loop-break"

@@ -3,7 +3,9 @@ import torch
 from ai.encoding import (
     Action,
     ACTION_ORDER,
+    ENHANCED_FEATURE_SIZE,
     encode_state,
+    encode_state_enhanced,
     goal_state,
     heuristic_score,
     legal_actions,
@@ -30,3 +32,16 @@ def test_encoding_changes_when_two_tiles_are_swapped():
 
     assert not torch.equal(encode_state(state), encode_state(swapped))
     assert heuristic_score(swapped) > heuristic_score(state)
+
+
+def test_enhanced_encoding_is_finite_and_preserves_permutation_signal():
+    state = goal_state()
+    swapped = state[:-3] + (15, 14, -1)
+
+    encoded = encode_state_enhanced(state)
+    swapped_encoded = encode_state_enhanced(swapped)
+
+    assert encoded.shape == (ENHANCED_FEATURE_SIZE,)
+    assert encoded.dtype == torch.float32
+    assert torch.isfinite(encoded).all()
+    assert not torch.equal(encoded, swapped_encoded)
